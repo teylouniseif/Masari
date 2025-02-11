@@ -1,0 +1,36 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="flouss",
+    version="0.1.0",
+    author="Saif Kurdi-Teylouni",
+    author_email="teylouniseif@gmail.com",
+    description="A trading bot",
+    long_description=open("README.md").read(),
+    long_description_content_type="text/markdown",
+    url="https://github.com/teylouniseif/flouss",
+    packages=find_packages(),
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+    ],
+    python_requires=">=3.10",
+    install_requires=[
+        "binance",
+        "alpaca-trade-api",
+        "web3",
+        "eth-account",
+        "openai",
+        "pytest-asyncio",
+        "langchain",
+        "langchain-community",
+        "langchain-core",
+        "langchain-openai",
+        "langchain-text-splitters",
+        "autopep8",
+        "pytest",
+        "pre-commit",
+        "python-binance",
+    ],
+)

@@ -1,0 +1,5 @@
+.*
+!.pre-commit-config.yaml
+!.gitignore
+*.pyc
+*.egg-info/

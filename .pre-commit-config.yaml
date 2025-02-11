@@ -1,0 +1,16 @@
+repos:
+  - repo: local
+    hooks:
+      - id: lint
+        name: lint
+        entry: autopep8
+        args: ["--in-place", "--aggressive", "--recursive", "."]
+        language: system
+        types: [python]
+      - id: test
+        name: test
+        entry: bash -c 'PYTHONPATH=$(git rev-parse --show-toplevel) pytest'
+        args: []
+        cwd: tests
+        language: system
+        pass_filenames: false
