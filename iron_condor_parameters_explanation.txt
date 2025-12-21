@@ -1,0 +1,182 @@
+IRON CONDOR STRATEGY PARAMETERS EXPLANATION
+============================================
+
+GLOSSARY OF KEY TERMS
+=====================
+• IV (Implied Volatility): The market's expectation of how much a stock's price will move, 
+  derived from option prices. Higher IV = market expects bigger price swings.
+
+• Historical Volatility: How much a stock's price actually moved in the past, calculated 
+  from historical price data.
+
+• Daily Returns: The percentage change in stock price from one day to the next.
+  FORMULA: (Today's Price - Yesterday's Price) / Yesterday's Price
+
+• Bid-Ask Spread: The difference between what buyers will pay (bid) and sellers will 
+  accept (ask). Tight spreads = good liquidity, wide spreads = poor liquidity.
+
+• Open Interest: The total number of option contracts that are currently active and 
+  haven't been exercised or expired yet.
+
+• Theta Decay: The rate at which an option loses value as time passes. Options lose 
+  value every day, which benefits option sellers.
+
+• Gamma Risk: How quickly an option's delta (price sensitivity) changes as the stock 
+  price moves. High gamma = rapid price changes in the option.
+
+• Delta: How much an option's price changes when the stock price changes by $1.
+
+• At-the-Money (ATM): An option where the strike price equals the current stock price.
+
+• 30-Delta Options: Options with approximately 30% probability of being in-the-money 
+  at expiration.
+
+WHAT IS AN IRON CONDOR?
+-----------------------
+An iron condor is an options strategy that profits when a stock's price remains within a 
+defined range until expiration. You simultaneously sell a put spread (betting the stock 
+won't go too low) and a call spread (betting the stock won't go too high). The strategy 
+collects premium upfront and profits if the stock stays between your defined strikes.
+
+These parameters identify stocks with the highest probability of staying range-bound, 
+maximizing the chance of profit while minimizing risk.
+
+PRICE AND VOLUME CRITERIA
+-------------------------
+• min_price: $50.0 
+  - COMPUTATION: Direct stock price from market data
+  - RATIONALE: Below $50, option premiums become too small relative to transaction costs
+  - RISK: Low-priced stocks often have wider spreads and less liquidity
+  - EXAMPLE: A $30 stock might only offer $0.50 premium, but cost $1.00 in spreads
+
+• max_price: $200.0 
+  - COMPUTATION: Direct stock price from market data
+  - RATIONALE: Above $200, margin requirements become excessive for retail traders
+  - RISK: High-priced stocks require significant capital and have higher absolute risk
+  - EXAMPLE: A $500 stock might require $50,000 in margin for a single contract
+
+• min_volume: 1,000,000 
+  - COMPUTATION: Average daily trading volume over the past 20 days
+  - FORMULA: Sum(daily_volume) / 20
+  - RATIONALE: High volume ensures tight bid-ask spreads and easy entry/exit
+  - RISK: Low volume stocks have wide spreads and may not fill orders
+  - EXAMPLE: AAPL trades ~50M shares daily vs. small caps trading 100K shares
+
+• min_market_cap: $1B 
+  - COMPUTATION: Market Cap = Current Stock Price × Total Shares Outstanding
+  - RATIONALE: Large companies have more stable business models and less bankruptcy risk
+  - RISK: Small caps can have extreme price movements and liquidity issues
+  - EXAMPLE: Apple ($3T market cap) vs. penny stocks ($10M market cap)
+
+VOLATILITY CRITERIA
+-------------------
+• min_implied_volatility: 20% 
+  - COMPUTATION: Derived from option prices using the Black-Scholes model
+  - FORMULA: IV = f(option_price, stock_price, strike, time_to_expiry, risk_free_rate)
+  - RATIONALE: 20% IV provides sufficient premium to overcome transaction costs
+  - INTERPRETATION: 20% IV means the market expects ±20% price movement annually
+  - EXAMPLE: A stock at $100 with 20% IV expects to be between $80-$120 in one year
+
+• max_implied_volatility: 50% 
+  - COMPUTATION: Same as min_implied_volatility
+  - RATIONALE: Above 50%, the stock is too unpredictable for reliable range prediction
+  - RISK: High IV stocks can break out of ranges due to earnings, news, or market events
+  - EXAMPLE: Biotech stocks often have 80%+ IV due to FDA approval uncertainty
+
+• max_historical_volatility: 40% 
+  - COMPUTATION: Standard deviation of daily returns, annualized
+  - FORMULA: HV = std_dev(daily_returns) × √252
+  - DAILY_RETURNS: (Price_today - Price_yesterday) / Price_yesterday
+  - RATIONALE: Historical volatility predicts future price stability
+  - INTERPRETATION: 40% HV means the stock moved ±40% in the past year
+  - EXAMPLE: Utility stocks have ~15% HV, tech stocks have ~30-40% HV
+
+• min_iv_skew: 5% 
+  - COMPUTATION: Difference between call and put implied volatility at same strike
+  - FORMULA: IV Skew = (IV_call - IV_put) / IV_put × 100
+  - RATIONALE: Positive skew indicates market expects upside movement, providing opportunity
+  - INTERPRETATION: 5% skew means calls are 5% more expensive than puts
+  - EXAMPLE: Before earnings, calls often have higher IV than puts (positive skew)
+
+LIQUIDITY CRITERIA
+------------------
+• min_option_volume: 1,000 
+  - COMPUTATION: Total option contracts traded across all strikes and expirations
+  - FORMULA: Sum(volume_for_all_options_of_stock)
+  - RATIONALE: High volume ensures tight spreads and reliable fills
+  - RISK: Low volume options may not fill or may fill at poor prices
+  - EXAMPLE: SPY options trade 500K+ contracts daily vs. small stocks with 100 contracts
+
+• min_open_interest: 500 
+  - COMPUTATION: Total outstanding option contracts (not yet exercised or expired)
+  - FORMULA: Sum(open_interest_for_all_options_of_stock)
+  - RATIONALE: High open interest indicates market maker presence and tighter spreads
+  - INTERPRETATION: 500 OI means 500 contracts are currently active
+  - EXAMPLE: Liquid stocks have 10K+ OI, illiquid stocks have <100 OI
+
+• max_bid_ask_spread: 10% 
+  - COMPUTATION: (Ask Price - Bid Price) / Bid Price × 100
+  - FORMULA: Spread% = (ask - bid) / bid × 100
+  - RATIONALE: Wide spreads eat into profits and increase transaction costs
+  - RISK: 10% spread means immediate 10% loss on round-trip trade
+  - EXAMPLE: Liquid options have 1-2% spreads, illiquid options have 20%+ spreads
+
+RANGE-BOUND CRITERIA
+--------------------
+• min_range_bound_score: 0.6 
+  - COMPUTATION: Combines price range analysis and mean reversion metrics
+  - FORMULA: Score = (range_score × 0.6) + (stability_score × 0.4)
+  - RANGE_SCORE: 1 - (price_range / average_price) [0-1 scale]
+  - STABILITY_SCORE: (1 + mean_reversion_correlation) / 2 [0-1 scale]
+  - MEAN_REVERSION: Tendency of prices to return to average after moving away
+  - RATIONALE: 0.6 indicates the stock has demonstrated range-bound behavior
+  - INTERPRETATION: Higher scores = more predictable, lower scores = more volatile
+
+• lookback_period: 90 days 
+  - COMPUTATION: Number of trading days used for historical analysis
+  - RATIONALE: 90 days captures recent market conditions without being too short
+  - RISK: Too short (30 days) misses patterns, too long (1 year) includes outdated data
+  - EXAMPLE: 90 days = ~4.5 months of trading data
+
+TIME CRITERIA
+-------------
+• min_days_to_expiry: 30 
+  - COMPUTATION: Calendar days from current date to option expiration
+  - RATIONALE: 30+ days allows sufficient time for theta decay to work in your favor
+  - RISK: Too short (7 days) = high gamma risk and low premium collection
+  - EXAMPLE: 30 DTE options have ~70% of premium as time value
+
+• max_days_to_expiry: 45 
+  - COMPUTATION: Calendar days from current date to option expiration
+  - RATIONALE: Beyond 45 days, gamma risk increases and time value becomes less predictable
+  - RISK: Longer time = more exposure to unexpected events (earnings, news, market crashes)
+  - EXAMPLE: 45 DTE options have ~60% of premium as time value
+
+WHY THESE MATTER FOR IRON CONDORS
+=================================
+1. RANGE-BOUND STOCKS: Stocks with low historical volatility and mean-reverting behavior 
+   are less likely to break out of defined ranges, reducing assignment risk
+
+2. HIGH LIQUIDITY: Tight bid-ask spreads and high volume ensure efficient entry/exit 
+   without significant slippage, preserving profit margins
+
+3. MODERATE VOLATILITY: Sufficient IV provides attractive premiums while keeping 
+   breakout risk manageable and predictable
+
+4. PROPER TIME FRAME: 30-45 DTE optimizes theta decay (time value erosion) while 
+   minimizing gamma risk (sensitivity to price changes)
+
+5. REASONABLE PRICE RANGE: Manageable position sizes and margin requirements allow 
+   for proper risk management and portfolio diversification
+
+TECHNICAL IMPLEMENTATION NOTES
+==============================
+• All metrics are calculated using real-time market data from Questrade API
+• Historical volatility uses 90-day lookback with daily returns
+• IV skew calculation uses 30-delta options for consistency
+• Range-bound score combines multiple statistical measures for robustness
+• All thresholds are empirically derived from backtesting results
+
+The goal is to identify stocks that exhibit predictable, range-bound behavior with 
+sufficient liquidity and volatility to generate consistent premium income while 
+minimizing the risk of catastrophic losses from unexpected price movements. 
