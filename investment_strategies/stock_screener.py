@@ -61,12 +61,6 @@ class StockScreener:
         return all_suitable_stocks
 
 if __name__ == '__main__':
-    from dotenv import load_dotenv
-    import os
-    from .questrade_data_fetcher import QuestradeCredentials
-
-    load_dotenv()
-    
     # This screener requires the 'lxml' package to read HTML from Wikipedia.
     try:
         import lxml
@@ -76,16 +70,9 @@ if __name__ == '__main__':
         exit()
 
     print("\nInitializing Questrade connection for the screener...")
-    
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    if not refresh_token:
-        print("Error: QUESTRADE_REFRESH_TOKEN not found in your .env file.")
-        exit()
 
-    credentials = QuestradeCredentials(refresh_token=refresh_token)
-    
     try:
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         screener = StockScreener(fetcher)
 
         sp500_stocks = screener.get_sp500_stocks()
@@ -117,4 +104,4 @@ if __name__ == '__main__':
 
     except Exception as e:
         print(f"\nAn error occurred during the screening process: {e}")
-        print("Please ensure your Questrade refresh token is valid and try again.") 
+        print("Please ensure questrade_credentials.json contains a valid refresh token and try again.") 

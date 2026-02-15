@@ -3,3 +3,4 @@
 !.gitignore
 *.pyc
 *.egg-info/
+questrade_credentials.json

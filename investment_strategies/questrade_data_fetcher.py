@@ -7,13 +7,27 @@ import time
 from dataclasses import dataclass
 import os
 import json
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # Constants
 CREDENTIALS_FILE = 'questrade_credentials.json'
+QUESTRADE_TOKEN_URL = "https://login.questrade.com/oauth2/token"
+
+
+def refresh_questrade_tokens(refresh_token: str, timeout_seconds: int = 20) -> Dict:
+    """
+    Exchange a refresh token for a new token bundle.
+    Questrade rotates refresh tokens, so callers should persist the returned refresh token.
+    """
+    response = requests.post(
+        QUESTRADE_TOKEN_URL,
+        params={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+    return response.json()
 
 @dataclass
 class PriceData:
@@ -70,11 +84,15 @@ class FundamentalMetrics:
     industry_revenue: float
 
 class QuestradeDataFetcher:
-    def __init__(self, credentials: QuestradeCredentials):
+    def __init__(self, credentials: Optional[QuestradeCredentials] = None):
         self.credentials = self._load_credentials() or credentials
-        if not self.credentials.access_token or self._is_token_expired():
-            self._authenticate()
-            self._save_credentials()
+        if not self.credentials or not self.credentials.refresh_token:
+            raise ValueError(
+                f"No Questrade refresh token available. Add one to {CREDENTIALS_FILE}."
+            )
+        # Always refresh at startup so each run rotates refresh_token and access_token.
+        self._authenticate()
+        self._save_credentials()
     
     def _load_credentials(self) -> Optional[QuestradeCredentials]:
         """Load credentials from file if exists"""
@@ -104,20 +122,17 @@ class QuestradeDataFetcher:
     
     def _authenticate(self):
         """Authenticate with Questrade API and get access token"""
-        auth_url = f"https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token={self.credentials.refresh_token}"
-        
         try:
-            response = requests.post(auth_url)
-            response.raise_for_status()
-            data = response.json()
-            
+            data = refresh_questrade_tokens(self.credentials.refresh_token)
             self.credentials.access_token = data['access_token']
             self.credentials.api_server = data['api_server']
-            # Set token expiry to 30 minutes from now (Questrade tokens typically expire in 30 minutes)
-            self.credentials.token_expiry = datetime.now() + timedelta(minutes=30)
+            self.credentials.refresh_token = data.get('refresh_token', self.credentials.refresh_token)
+            expires_in_seconds = int(data.get('expires_in', 1800))
+            self.credentials.token_expiry = datetime.now() + timedelta(seconds=expires_in_seconds)
             
         except requests.exceptions.RequestException as e:
-            if response.status_code == 400:
+            status_code = e.response.status_code if getattr(e, "response", None) is not None else None
+            if status_code == 400:
                 print("Error: Invalid refresh token or token already used. Please generate a new refresh token.")
                 # Remove invalid credentials file
                 if os.path.exists(CREDENTIALS_FILE):
@@ -514,12 +529,7 @@ def create_price_data_from_questrade(historical_data: List[Dict]) -> List[PriceD
 
 # Example usage
 if __name__ == "__main__":
-    # Initialize with your Questrade refresh token
-    credentials = QuestradeCredentials(
-        refresh_token=os.getenv('QUESTRADE_REFRESH_TOKEN')
-    )
-    
-    fetcher = QuestradeDataFetcher(credentials)
+    fetcher = QuestradeDataFetcher()
     
     # Example: Get fundamental metrics for AAPL
     try:

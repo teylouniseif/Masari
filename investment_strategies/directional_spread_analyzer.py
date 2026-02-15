@@ -215,21 +215,8 @@ class BearPutSpreadAnalyzer(BaseDirectionalAnalyzer):
             return {'symbol': symbol, 'error': str(e)}
 
 if __name__ == '__main__':
-    from dotenv import load_dotenv
-    import os
-    from .questrade_data_fetcher import QuestradeCredentials
-    
-    load_dotenv()
-    
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    if not refresh_token:
-        print("Error: QUESTRADE_REFRESH_TOKEN not found.")
-        exit()
-
-    credentials = QuestradeCredentials(refresh_token=refresh_token)
-    
     try:
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         
         # --- Test Bull Call Spread Analyzer ---
         bull_analyzer = BullCallSpreadAnalyzer(fetcher)

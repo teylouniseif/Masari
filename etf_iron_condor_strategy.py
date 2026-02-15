@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import time
 
 from investment_strategies.questrade_data_fetcher import QuestradeDataFetcher
-from investment_strategies.questrade_credentials import QuestradeCredentials
 from investment_strategies.iron_condor_analyzer import IronCondorAnalyzer
 from investment_strategies.strategy_config import StrategyConfig
 
@@ -542,20 +541,8 @@ class ETFIronCondorStrategy:
                 time.sleep(300)  # Wait 5 minutes before retrying
 
 if __name__ == '__main__':
-    from dotenv import load_dotenv
-    import os
-
-    
-    load_dotenv()
-    
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    if not refresh_token:
-        print("Error: QUESTRADE_REFRESH_TOKEN not found in your .env file.")
-        exit()
-    
     try:
-        credentials = QuestradeCredentials(refresh_token=refresh_token)
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         strategy = ETFIronCondorStrategy(fetcher)
         
         # Run the strategy

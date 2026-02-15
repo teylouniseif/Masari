@@ -115,4 +115,40 @@ print(conversation.get_messages(stringified=True))
 
 This project is licensed under the MIT License. See the LICENSE file for details.
 
+---
 
+## Run `test_options_buy_strategy.py`
+
+This test calls the live Questrade API, so it needs dependencies plus a valid Questrade refresh token.
+
+1. Install dependencies:
+
+```bash
+python3 -m pip install --user -e .
+```
+
+2. Copy the template and fill your refresh token:
+
+```bash
+cp questrade_credentials.template.json questrade_credentials.json
+```
+
+Then edit `questrade_credentials.json` and set the `refresh_token` field:
+
+```json
+{
+  "refresh_token": "your_fresh_refresh_token_here"
+}
+```
+
+Note: if you see `refresh_toek` anywhere, that is a typo; use `refresh_token`.
+
+3. Run the test script:
+
+```bash
+python3 test_options_buy_strategy.py
+```
+
+Notes:
+- Questrade refresh tokens are single-use/short-lived; generate a new one if you get HTTP 400.
+- The script is an integration test and depends on network access to `login.questrade.com`.

@@ -4,9 +4,7 @@ Test script for the Options Buying Strategy
 This demonstrates how to use the strategy to find options buying opportunities.
 """
 
-import os
-from dotenv import load_dotenv
-from investment_strategies.questrade_data_fetcher import QuestradeCredentials, QuestradeDataFetcher
+from investment_strategies.questrade_data_fetcher import QuestradeDataFetcher
 from investment_strategies.options_buy_strategy import OptionsBuyStrategy
 
 def test_options_buying_strategy():
@@ -15,17 +13,8 @@ def test_options_buying_strategy():
     print("OPTIONS BUYING STRATEGY - TEST")
     print("=" * 60)
     
-    # Initialize the strategy
-    load_dotenv()
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    
-    if not refresh_token:
-        print("Error: QUESTRADE_REFRESH_TOKEN not found in your .env file.")
-        return
-    
     try:
-        credentials = QuestradeCredentials(refresh_token=refresh_token)
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         strategy = OptionsBuyStrategy(fetcher)
         
         print(f"Strategy Criteria:")
@@ -128,7 +117,6 @@ def test_options_buying_strategy():
 
 if __name__ == '__main__':
     test_options_buying_strategy()
-
 
 
 

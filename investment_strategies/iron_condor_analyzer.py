@@ -3,9 +3,6 @@ from typing import List, Dict, Optional, Tuple
 import pandas as pd
 import numpy as np
 from .questrade_data_fetcher import QuestradeDataFetcher
-from .questrade_credentials import QuestradeCredentials
-import os
-from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
 @dataclass
@@ -380,15 +377,8 @@ class IronCondorAnalyzer:
         return suitable_stocks
 
 if __name__ == '__main__':
-    load_dotenv()
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    if not refresh_token:
-        print("Error: QUESTRADE_REFRESH_TOKEN not found in your .env file.")
-        exit()
-
     try:
-        credentials = QuestradeCredentials(refresh_token=refresh_token)
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         analyzer = IronCondorAnalyzer(fetcher)
         
         # --- Test with a list of diverse stocks ---

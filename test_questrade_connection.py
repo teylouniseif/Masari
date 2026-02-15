@@ -3,32 +3,14 @@
 Test script to verify Questrade API connection and data retrieval
 """
 
-import os
-from dotenv import load_dotenv
-from investment_strategies.questrade_data_fetcher import QuestradeDataFetcher, QuestradeCredentials
+from investment_strategies.questrade_data_fetcher import QuestradeDataFetcher
 from investment_strategies.iron_condor_analyzer import IronCondorAnalyzer
 
 def test_questrade_connection():
     """Test the Questrade API connection and basic data retrieval"""
     
-    # Load environment variables
-    load_dotenv()
-    
-    # Get refresh token from environment
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    if not refresh_token:
-        print("Error: QUESTRADE_REFRESH_TOKEN not found in environment variables")
-        print("Please add your refresh token to the .env file")
-        return False
-    
-    print(f"Using refresh token: {refresh_token[:10]}...")
-    
     try:
-        # Initialize credentials and data fetcher
-        credentials = QuestradeCredentials(refresh_token=refresh_token)
-        print("✓ Credentials initialized")
-        
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         print("✓ Data fetcher initialized")
         
         # Test basic quote retrieval
@@ -99,8 +81,8 @@ if __name__ == "__main__":
     if success:
         print("\nYou can now use the iron condor analyzer with your Questrade account!")
     else:
-        print("\nPlease check your refresh token and try again.")
+        print("\nPlease check questrade_credentials.json and try again.")
         print("Make sure to:")
         print("1. Generate a new refresh token from Questrade API Access")
-        print("2. Add it to your .env file as QUESTRADE_REFRESH_TOKEN")
-        print("3. Run this test again") 
+        print("2. Save it in questrade_credentials.json under refresh_token")
+        print("3. Run this test again")

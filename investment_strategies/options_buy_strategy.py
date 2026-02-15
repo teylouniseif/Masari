@@ -10,10 +10,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 try:
     from .questrade_data_fetcher import QuestradeDataFetcher
-    from .questrade_credentials import QuestradeCredentials
 except ImportError:
     from questrade_data_fetcher import QuestradeDataFetcher
-    from questrade_credentials import QuestradeCredentials
 
 @dataclass
 class OptionsBuyCriteria:
@@ -625,19 +623,8 @@ class OptionsBuyStrategy:
             return False
 
 if __name__ == '__main__':
-    from dotenv import load_dotenv
-    import os
-    
-    load_dotenv()
-    
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    if not refresh_token:
-        print("Error: QUESTRADE_REFRESH_TOKEN not found in your .env file.")
-        exit()
-    
     try:
-        credentials = QuestradeCredentials(refresh_token=refresh_token)
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         strategy = OptionsBuyStrategy(fetcher)
         
         # Test symbols

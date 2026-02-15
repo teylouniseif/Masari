@@ -22,6 +22,10 @@ setup(
         "web3",
         "eth-account",
         "openai",
+        "python-dotenv",
+        "requests",
+        "pandas",
+        "numpy",
         "pytest-asyncio",
         "langchain",
         "langchain-community",
@@ -32,5 +36,6 @@ setup(
         "pytest",
         "pre-commit",
         "python-binance",
+        "yfinance",
     ],
 )

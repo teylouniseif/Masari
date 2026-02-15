@@ -4,9 +4,7 @@ Test script for the ETF Iron Condor Strategy
 This demonstrates how to use the strategy to scan for opportunities and manage positions.
 """
 
-import os
-from dotenv import load_dotenv
-from investment_strategies.questrade_data_fetcher import QuestradeCredentials, QuestradeDataFetcher
+from investment_strategies.questrade_data_fetcher import QuestradeDataFetcher
 from etf_iron_condor_strategy import ETFIronCondorStrategy
 
 def test_strategy_scanning():
@@ -15,17 +13,8 @@ def test_strategy_scanning():
     print("ETF IRON CONDOR STRATEGY - SCANNING TEST")
     print("=" * 60)
     
-    # Initialize the strategy
-    load_dotenv()
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    
-    if not refresh_token:
-        print("Error: QUESTRADE_REFRESH_TOKEN not found in your .env file.")
-        return
-    
     try:
-        credentials = QuestradeCredentials(refresh_token=refresh_token)
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         strategy = ETFIronCondorStrategy(fetcher)
         
         print(f"ETF Universe: {', '.join(strategy.etf_universe)}")

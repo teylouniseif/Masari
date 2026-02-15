@@ -3,24 +3,14 @@
 Debug script to examine Questrade option chain data structure
 """
 
-import os
-from dotenv import load_dotenv
-from investment_strategies.questrade_data_fetcher import QuestradeDataFetcher, QuestradeCredentials
+from investment_strategies.questrade_data_fetcher import QuestradeDataFetcher
 import json
 
 def debug_option_chain():
     """Debug the option chain data structure"""
     
-    # Load environment variables
-    load_dotenv()
-    
-    # Get refresh token from environment
-    refresh_token = os.getenv('QUESTRADE_REFRESH_TOKEN')
-    
     try:
-        # Initialize credentials and data fetcher
-        credentials = QuestradeCredentials(refresh_token=refresh_token)
-        fetcher = QuestradeDataFetcher(credentials)
+        fetcher = QuestradeDataFetcher()
         
         # Get option chain for AAPL
         print("Getting option chain for AAPL...")
