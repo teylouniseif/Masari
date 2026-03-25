@@ -14,6 +14,7 @@ class QuestradeCredentials:
     access_token: str = ""
     api_server: str = ""
     token_expiry: datetime = None
+    token_url: str = "https://login.questrade.com/oauth2/token"
 
     def to_dict(self) -> Dict:
         """Convert credentials to dictionary for storage"""
@@ -21,7 +22,8 @@ class QuestradeCredentials:
             'refresh_token': self.refresh_token,
             'access_token': self.access_token,
             'api_server': self.api_server,
-            'token_expiry': self.token_expiry.isoformat() if self.token_expiry else None
+            'token_expiry': self.token_expiry.isoformat() if self.token_expiry else None,
+            'token_url': self.token_url,
         }
 
     @classmethod
@@ -31,7 +33,8 @@ class QuestradeCredentials:
             refresh_token=data['refresh_token'],
             access_token=data.get('access_token', ""),
             api_server=data.get('api_server', ""),
-            token_expiry=datetime.fromisoformat(data['token_expiry']) if data.get('token_expiry') else None
+            token_expiry=datetime.fromisoformat(data['token_expiry']) if data.get('token_expiry') else None,
+            token_url=data.get('token_url', "https://login.questrade.com/oauth2/token"),
         )
 
     def save_to_file(self, filename: str = 'questrade_credentials.json'):

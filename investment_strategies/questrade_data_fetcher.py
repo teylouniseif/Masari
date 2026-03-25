@@ -3,23 +3,27 @@ import pandas as pd
 import yfinance as yf
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
-import time
 from dataclasses import dataclass
 import os
 import json
 
 # Constants
 CREDENTIALS_FILE = 'questrade_credentials.json'
-QUESTRADE_TOKEN_URL = "https://login.questrade.com/oauth2/token"
+DEFAULT_QUESTRADE_TOKEN_URL = "https://login.questrade.com/oauth2/token"
+PRACTICE_QUESTRADE_TOKEN_URL = "https://practicelogin.questrade.com/oauth2/token"
 
 
-def refresh_questrade_tokens(refresh_token: str, timeout_seconds: int = 20) -> Dict:
+def refresh_questrade_tokens(
+    refresh_token: str,
+    token_url: str = DEFAULT_QUESTRADE_TOKEN_URL,
+    timeout_seconds: int = 20,
+) -> Dict:
     """
     Exchange a refresh token for a new token bundle.
     Questrade rotates refresh tokens, so callers should persist the returned refresh token.
     """
     response = requests.post(
-        QUESTRADE_TOKEN_URL,
+        token_url,
         params={
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -44,6 +48,7 @@ class QuestradeCredentials:
     access_token: str = ""
     api_server: str = ""
     token_expiry: datetime = None
+    token_url: str = DEFAULT_QUESTRADE_TOKEN_URL
 
     def to_dict(self) -> Dict:
         """Convert credentials to dictionary for storage"""
@@ -51,7 +56,8 @@ class QuestradeCredentials:
             'refresh_token': self.refresh_token,
             'access_token': self.access_token,
             'api_server': self.api_server,
-            'token_expiry': self.token_expiry.isoformat() if self.token_expiry else None
+            'token_expiry': self.token_expiry.isoformat() if self.token_expiry else None,
+            'token_url': self.token_url,
         }
 
     @classmethod
@@ -61,7 +67,8 @@ class QuestradeCredentials:
             refresh_token=data['refresh_token'],
             access_token=data.get('access_token', ""),
             api_server=data.get('api_server', ""),
-            token_expiry=datetime.fromisoformat(data['token_expiry']) if data.get('token_expiry') else None
+            token_expiry=datetime.fromisoformat(data['token_expiry']) if data.get('token_expiry') else None,
+            token_url=data.get('token_url', DEFAULT_QUESTRADE_TOKEN_URL),
         )
 
 @dataclass
@@ -123,7 +130,10 @@ class QuestradeDataFetcher:
     def _authenticate(self):
         """Authenticate with Questrade API and get access token"""
         try:
-            data = refresh_questrade_tokens(self.credentials.refresh_token)
+            data = refresh_questrade_tokens(
+                self.credentials.refresh_token,
+                token_url=self.credentials.token_url or DEFAULT_QUESTRADE_TOKEN_URL,
+            )
             self.credentials.access_token = data['access_token']
             self.credentials.api_server = data['api_server']
             self.credentials.refresh_token = data.get('refresh_token', self.credentials.refresh_token)
@@ -139,8 +149,14 @@ class QuestradeDataFetcher:
                     os.remove(CREDENTIALS_FILE)
             raise Exception(f"Authentication failed: {str(e)}")
     
-    def _make_request(self, endpoint: str, params: Dict = None) -> Dict:
-        """Make authenticated request to Questrade API"""
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Dict = None,
+        payload: Optional[Dict] = None,
+    ) -> Dict:
+        """Make authenticated request to Questrade API."""
         # Check if token needs refresh
         if self._is_token_expired():
             self._authenticate()
@@ -151,21 +167,48 @@ class QuestradeDataFetcher:
         }
         
         url = f"{self.credentials.api_server}v1/{endpoint}"
+        method = method.upper()
         try:
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=payload,
+            )
             
             # If we get a 401, try to refresh the token and retry once
             if response.status_code == 401:
                 self._authenticate()
                 self._save_credentials()
                 headers['Authorization'] = f'Bearer {self.credentials.access_token}'
-                response = requests.get(url, headers=headers, params=params)
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=payload,
+                )
                 
             response.raise_for_status()
             return response.json()
             
         except requests.exceptions.RequestException as e:
+            status_code = e.response.status_code if getattr(e, "response", None) is not None else None
+            if status_code == 403:
+                raise Exception(
+                    "API request was denied (HTTP 403). If this is a trade endpoint, "
+                    "your token likely does not have trade scope."
+                )
             raise Exception(f"API request failed: {str(e)}")
+
+    def _make_request(self, endpoint: str, params: Dict = None) -> Dict:
+        """Make authenticated GET request to Questrade API."""
+        return self._request("GET", endpoint, params=params)
+
+    def _post_request(self, endpoint: str, payload: Optional[Dict] = None) -> Dict:
+        """Make authenticated POST request to Questrade API."""
+        return self._request("POST", endpoint, payload=payload)
     
     def get_symbol_id(self, symbol: str) -> int:
         """Get Questrade symbol ID for a given ticker symbol, preferring US equity listings"""
@@ -223,6 +266,17 @@ class QuestradeDataFetcher:
         
         data = self._make_request(endpoint)
         return data['quotes'][0]
+
+    def get_quotes_by_ids(self, symbol_ids: List[int]) -> Dict[int, Dict]:
+        """Get quotes for one or many symbol IDs and return a symbolId->quote map."""
+        cleaned_ids = [int(sid) for sid in symbol_ids if sid is not None]
+        if not cleaned_ids:
+            return {}
+
+        endpoint = f"markets/quotes/{','.join(str(sid) for sid in cleaned_ids)}"
+        data = self._make_request(endpoint)
+        quotes = data.get("quotes", [])
+        return {int(q.get("symbolId")): q for q in quotes if q.get("symbolId") is not None}
     
     def get_market_data_for_strategy(self,
                                    symbol: str,
@@ -247,12 +301,34 @@ class QuestradeDataFetcher:
         endpoint = "accounts/positions"
         data = self._make_request(endpoint)
         return data['positions']
+
+    def get_accounts(self) -> List[Dict]:
+        """Get all accounts available to the authenticated user."""
+        data = self._make_request("accounts")
+        return data.get("accounts", [])
     
     def get_account_balances(self) -> Dict:
         """Get account balances"""
         endpoint = "accounts/balances"
         data = self._make_request(endpoint)
         return data['perCurrencyBalances']
+
+    def get_account_orders(self, account_id: str) -> List[Dict]:
+        """Get orders for a specific account."""
+        data = self._make_request(f"accounts/{account_id}/orders")
+        return data.get("orders", [])
+
+    def get_order(self, account_id: str, order_id: int) -> Dict:
+        """Get a single order by account and order id."""
+        return self._make_request(f"accounts/{account_id}/orders/{order_id}")
+
+    def get_order_impact(self, account_id: str, order_payload: Dict) -> Dict:
+        """Preview buying-power impact for an order."""
+        return self._post_request(f"accounts/{account_id}/orders/impact", payload=order_payload)
+
+    def place_order(self, account_id: str, order_payload: Dict) -> Dict:
+        """Place an order for an account."""
+        return self._post_request(f"accounts/{account_id}/orders", payload=order_payload)
     
     def get_option_chain(self, symbol: str) -> Dict:
         """
@@ -262,27 +338,62 @@ class QuestradeDataFetcher:
             symbol_id = self.get_symbol_id(symbol)
             endpoint = f"symbols/{symbol_id}/options"
             data = self._make_request(endpoint)
+            if os.getenv("DEBUG_OPTIONS") == "1":
+                self._debug_option_chain(symbol, symbol_id, data)
             
             # Handle different possible response structures
             if isinstance(data, dict):
                 # Check for different possible keys
-                if 'options' in data:
+                if 'optionChain' in data:
                     return data
-                elif 'optionChain' in data:
-                    return {'options': data['optionChain']}
+                elif 'options' in data:
+                    return {
+                        'optionChain': data['options'],
+                        'options': data['options'],
+                    }
                 elif 'option' in data:
-                    return {'options': [data['option']]}
+                    option_list = [data['option']]
+                    return {'optionChain': option_list, 'options': option_list}
                 else:
                     # If no expected keys, return the data as is
-                    return {'options': data if isinstance(data, list) else []}
+                    option_list = data if isinstance(data, list) else []
+                    return {'optionChain': option_list, 'options': option_list}
             elif isinstance(data, list):
-                return {'options': data}
+                return {'optionChain': data, 'options': data}
             else:
-                return {'options': []}
+                return {'optionChain': [], 'options': []}
                 
         except Exception as e:
             print(f"Error getting option chain for {symbol}: {str(e)}")
-            return {'options': []}
+            return {'optionChain': [], 'options': []}
+
+    def _debug_option_chain(self, symbol: str, symbol_id: int, data: object) -> None:
+        """Print a compact summary of option chain payloads for debugging."""
+        try:
+            print(f"[DEBUG] Option chain raw type for {symbol} (ID: {symbol_id}): {type(data).__name__}")
+            if isinstance(data, dict):
+                print(f"[DEBUG] Option chain top-level keys: {list(data.keys())}")
+                chain = data.get("optionChain") or data.get("options") or []
+            elif isinstance(data, list):
+                chain = data
+            else:
+                chain = []
+
+            print(f"[DEBUG] Option chain blocks: {len(chain)}")
+            for idx, expiry_block in enumerate(chain[:2], start=1):
+                expiry_date = expiry_block.get("expiryDate")
+                roots = expiry_block.get("chainPerRoot", [])
+                print(f"[DEBUG]  Block {idx}: expiryDate={expiry_date} roots={len(roots)}")
+                if not roots:
+                    continue
+                first_root = roots[0]
+                strikes = first_root.get("chainPerStrikePrice", [])
+                print(f"[DEBUG]   First root strikes={len(strikes)}")
+                if strikes:
+                    sample = strikes[0]
+                    print(f"[DEBUG]   Sample strike keys={list(sample.keys())}")
+        except Exception as debug_err:
+            print(f"[DEBUG] Option chain summary failed: {debug_err}")
 
     def get_fundamental_metrics(self, symbol: str) -> FundamentalMetrics:
         """

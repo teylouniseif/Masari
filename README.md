@@ -152,3 +152,41 @@ python3 test_options_buy_strategy.py
 Notes:
 - Questrade refresh tokens are single-use/short-lived; generate a new one if you get HTTP 400.
 - The script is an integration test and depends on network access to `login.questrade.com`.
+
+## Paper Option Execution (Questrade Practice)
+
+This repo now includes a sandbox execution module that takes opportunities from `OptionsBuyStrategy` and builds Questrade option orders:
+
+- Module: `investment_strategies/questrade_optionsplay_sandbox.py`
+- Script: `test_optionsplay_sandbox_execution.py`
+- Uses:
+  - `POST /accounts/:id/orders/impact` (preview)
+  - `POST /accounts/:id/orders` (submit)
+
+### Setup
+
+1. Use a **practice** refresh token.
+2. Set `token_url` in `questrade_credentials.json`:
+
+```json
+{
+  "refresh_token": "your_practice_refresh_token",
+  "token_url": "https://practicelogin.questrade.com/oauth2/token"
+}
+```
+
+### Run
+
+Preview-only (default):
+
+```bash
+python3 test_optionsplay_sandbox_execution.py
+```
+
+Submit to sandbox:
+
+```bash
+python3 test_optionsplay_sandbox_execution.py --submit
+```
+
+If your token/app does not have trade permission, Questrade will reject order endpoints with HTTP 403.

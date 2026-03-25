@@ -4,3 +4,4 @@
 *.pyc
 *.egg-info/
 questrade_credentials.json
+alpaca_credentials.json
