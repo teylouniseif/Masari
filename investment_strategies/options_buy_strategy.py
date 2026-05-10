@@ -5,13 +5,27 @@ This strategy identifies optimal entry points for buying options and determines 
 
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-try:
-    from .questrade_data_fetcher import QuestradeDataFetcher
-except ImportError:
-    from questrade_data_fetcher import QuestradeDataFetcher
+
+
+class OptionsDataFetcher(Protocol):
+    def get_quote(self, symbol: str) -> Dict[str, Any]:
+        ...
+
+    def get_historical_data(
+        self,
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        period: Optional[str] = None,
+        interval: str = "1d",
+    ) -> List[Dict[str, Any]]:
+        ...
+
+    def get_option_chain(self, symbol: str) -> Dict[str, Any]:
+        ...
 
 @dataclass
 class OptionsBuyCriteria:
@@ -25,7 +39,7 @@ class OptionsBuyCriteria:
     min_market_cap: float = 1_000_000_000  # $1B
     
     # Options Criteria
-    min_days_to_expiry: int = 21  # Minimum 3 weeks
+    min_days_to_expiry: int = 0  # Minimum 3 weeks
     max_days_to_expiry: int = 45  # Maximum 6.5 weeks
     min_option_volume: int = 100
     min_open_interest: int = 200
@@ -52,7 +66,7 @@ class OptionsBuyStrategy:
     Strategy for buying options and finding optimal exit points
     """
     
-    def __init__(self, data_fetcher: QuestradeDataFetcher):
+    def __init__(self, data_fetcher: OptionsDataFetcher):
         self.data_fetcher = data_fetcher
         self.criteria = OptionsBuyCriteria()
         
@@ -681,6 +695,11 @@ class OptionsBuyStrategy:
 
 if __name__ == '__main__':
     try:
+        try:
+            from .questrade_data_fetcher import QuestradeDataFetcher
+        except ImportError:
+            from questrade_data_fetcher import QuestradeDataFetcher
+
         fetcher = QuestradeDataFetcher()
         strategy = OptionsBuyStrategy(fetcher)
         

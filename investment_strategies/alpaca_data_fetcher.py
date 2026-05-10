@@ -195,7 +195,7 @@ class AlpacaDataFetcher:
             "v2/stocks/snapshots",
             params={"symbols": symbol, "feed": self.data_feed},
         )
-        snapshot = data.get("snapshots", {}).get(symbol)
+        snapshot = data.get(symbol, {})
         if not snapshot:
             raise ValueError(f"No snapshot returned for {symbol}")
 
