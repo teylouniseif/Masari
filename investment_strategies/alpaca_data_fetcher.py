@@ -147,6 +147,9 @@ class AlpacaDataFetcher:
             base_url=self.credentials.data_base_url,
         )
 
+    def _chunked(self, values: List[str], size: int) -> List[List[str]]:
+        return [values[idx : idx + size] for idx in range(0, len(values), size)]
+
     def get_account(self) -> Dict[str, Any]:
         return self._request("GET", "v2/account")
 
@@ -284,6 +287,7 @@ class AlpacaDataFetcher:
 
             quote = snapshot.get("latestQuote", {})
             day_bar = snapshot.get("dailyBar", {})
+            greeks = snapshot.get("greeks", {})
 
             option_payload = {
                 "symbol": option_symbol,
@@ -291,7 +295,12 @@ class AlpacaDataFetcher:
                 "ask": quote.get("ap", 0.0) or 0.0,
                 "volume": day_bar.get("v", snapshot.get("volume", 0)) or 0,
                 "openInterest": snapshot.get("open_interest", 0) or 0,
-                "volatility": snapshot.get("implied_volatility", 0) or 0,
+                "impliedVolatility": snapshot.get("impliedVolatility", 0) or 0,
+                "delta": greeks.get("delta"),
+                "gamma": greeks.get("gamma"),
+                "theta": greeks.get("theta"),
+                "vega": greeks.get("vega"),
+                "rho": greeks.get("rho"),
             }
 
             grouped.setdefault(expiry_key, {})
@@ -320,6 +329,83 @@ class AlpacaDataFetcher:
         )
         snapshots = data.get("snapshots", {})
         return self._normalize_option_snapshots(snapshots)
+
+    def get_option_contracts(
+        self,
+        underlying_symbol: str,
+        expiration_date: Optional[str] = None,
+        expiration_date_gte: Optional[str] = None,
+        expiration_date_lte: Optional[str] = None,
+        status: str = "active",
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "underlying_symbols": underlying_symbol,
+            "status": status,
+            "limit": limit,
+        }
+        if expiration_date:
+            params["expiration_date"] = expiration_date
+        if expiration_date_gte:
+            params["expiration_date_gte"] = expiration_date_gte
+        if expiration_date_lte:
+            params["expiration_date_lte"] = expiration_date_lte
+
+        data = self._request("GET", "v2/options/contracts", params=params)
+        return data.get("option_contracts", [])
+
+    def get_option_snapshots(
+        self,
+        option_symbols: List[str],
+        feed: str = "indicative",
+    ) -> Dict[str, Dict[str, Any]]:
+        snapshots: Dict[str, Dict[str, Any]] = {}
+        for chunk in self._chunked(option_symbols, 100):
+            if not chunk:
+                continue
+            data = self._data_request(
+                "GET",
+                "v1beta1/options/snapshots",
+                params={
+                    "symbols": ",".join(chunk),
+                    "feed": feed,
+                    "limit": len(chunk),
+                },
+            )
+            snapshots.update(data.get("snapshots", {}))
+        return snapshots
+
+    def get_weekly_option_window(
+        self,
+        underlying_symbol: str,
+        start_date: Optional[str] = None,
+        days: int = 7,
+        feed: str = "indicative",
+    ) -> Dict[str, Any]:
+        start_dt = (
+            datetime.strptime(start_date, "%Y-%m-%d")
+            if start_date
+            else datetime.utcnow()
+        )
+        end_dt = start_dt + timedelta(days=days)
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_str = end_dt.strftime("%Y-%m-%d")
+
+        contracts = self.get_option_contracts(
+            underlying_symbol=underlying_symbol,
+            expiration_date_gte=start_str,
+            expiration_date_lte=end_str,
+        )
+        option_symbols = [contract["symbol"] for contract in contracts if contract.get("symbol")]
+        snapshots = self.get_option_snapshots(option_symbols, feed=feed) if option_symbols else {}
+
+        return {
+            "underlying_symbol": underlying_symbol,
+            "start_date": start_str,
+            "end_date": end_str,
+            "contracts": contracts,
+            "snapshots": snapshots,
+        }
 
     def get_order_impact(self, account_id: str, order_payload: Dict[str, Any]) -> Dict[str, Any]:
         qty = float(order_payload.get("qty") or order_payload.get("quantity") or 0)
