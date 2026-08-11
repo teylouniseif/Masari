@@ -135,31 +135,31 @@ class OptionsBuyStrategy:
                             
                             # Analyze calls
                             call_data = self._resolve_option_leg_data(strike_data, "call", option_quote_lookup)
-                            #if call_data and self._is_option_suitable(call_data, strike_price):
-                            suitable_options.append({
-                                'type': 'call',
-                                'strike': strike_price,
-                                'dte': dte,
-                                'bid': call_data.get('bid', 0),
-                                'ask': call_data.get('ask', 0),
-                                'volume': call_data.get('volume', 0),
-                                'open_interest': call_data.get('openInterest', call_data.get('open_interest', 0)),
-                                'iv': call_data.get('volatility', call_data.get('impliedVolatility', 0)),
-                            })
-                            
+                            if call_data and self._is_option_suitable(call_data, strike_price):
+                                suitable_options.append({
+                                    'type': 'call',
+                                    'strike': strike_price,
+                                    'dte': dte,
+                                    'bid': call_data.get('bid', 0),
+                                    'ask': call_data.get('ask', 0),
+                                    'volume': call_data.get('volume', 0),
+                                    'open_interest': call_data.get('openInterest', call_data.get('open_interest', 0)),
+                                    'iv': call_data.get('volatility', call_data.get('impliedVolatility', 0)),
+                                })
+
                             # Analyze puts
                             put_data = self._resolve_option_leg_data(strike_data, "put", option_quote_lookup)
-                            #if put_data and self._is_option_suitable(put_data, strike_price):
-                            suitable_options.append({
-                                'type': 'put',
-                                'strike': strike_price,
-                                'dte': dte,
-                                'bid': put_data.get('bid', 0),
-                                'ask': put_data.get('ask', 0),
-                                'volume': put_data.get('volume', 0),
-                                'open_interest': put_data.get('openInterest', put_data.get('open_interest', 0)),
-                                'iv': put_data.get('volatility', put_data.get('impliedVolatility', 0)),
-                            })
+                            if put_data and self._is_option_suitable(put_data, strike_price):
+                                suitable_options.append({
+                                    'type': 'put',
+                                    'strike': strike_price,
+                                    'dte': dte,
+                                    'bid': put_data.get('bid', 0),
+                                    'ask': put_data.get('ask', 0),
+                                    'volume': put_data.get('volume', 0),
+                                    'open_interest': put_data.get('openInterest', put_data.get('open_interest', 0)),
+                                    'iv': put_data.get('volatility', put_data.get('impliedVolatility', 0)),
+                                })
             
             return {'options': suitable_options}
             
@@ -223,9 +223,7 @@ class OptionsBuyStrategy:
         volume = option_data.get('volume', 0)
         open_interest = option_data.get('openInterest', 0)
         iv = option_data.get('volatility', 0)
-        
-        return True
-        
+
         if bid <= 0 or ask <= 0:
             return False
         
