@@ -172,6 +172,36 @@ def test_alpaca_weekly_options(symbol: str, days: int) -> bool:
         print(f"  With IV     : {entries_with_iv}")
         print(f"  With Greeks : {entries_with_greeks}")
 
+        # ── option bars ──────────────────────────────────────────────────────
+        print("\nFetching 1-hour option bars for up to 10 contracts...")
+        sample_symbols = [c["symbol"] for c in contracts[:10] if c.get("symbol")]
+        bars_path = Path(f"{symbol.lower()}_weekly_options_bars.json")
+        try:
+            bars = fetcher.get_option_bars(sample_symbols, timeframe="1Hour")
+            bars_found = {sym: b for sym, b in bars.items() if b}
+            print(f"  Symbols requested : {len(sample_symbols)}")
+            print(f"  Symbols with bars : {len(bars_found)}")
+
+            with bars_path.open("w", encoding="utf-8") as fh:
+                json.dump(bars, fh, indent=2)
+            print(f"✓ Option bars saved to {bars_path}")
+
+            if bars_found:
+                sample_sym, sample_bars = next(iter(bars_found.items()))
+                print(f"\nSample bars for {sample_sym} ({len(sample_bars)} bar(s)):")
+                for bar in sample_bars[:3]:
+                    print(
+                        f"  {bar['timestamp']}  O={bar['open']}  H={bar['high']}"
+                        f"  L={bar['low']}  C={bar['close']}  V={bar['volume']}"
+                    )
+            else:
+                print("~ No bars returned (contracts may not have traded in the last 24h)")
+        except PermissionError as exc:
+            print(f"~ Option bars skipped: {exc}")
+            with bars_path.open("w", encoding="utf-8") as fh:
+                json.dump({"error": str(exc), "symbols_requested": sample_symbols}, fh, indent=2)
+            print(f"✓ Bars error note saved to {bars_path}")
+
         print("\n✓ All checks passed.")
         return True
 

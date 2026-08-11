@@ -5,3 +5,4 @@
 *.egg-info/
 questrade_credentials.json
 alpaca_credentials.json
+alpaca_sandbox_positions.json

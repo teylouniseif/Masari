@@ -3,11 +3,16 @@ Options Buying Strategy - Buy and Sell Options for Profit
 This strategy identifies optimal entry points for buying options and determines when to sell them.
 """
 
+import json
+import os
 import pandas as pd
 import numpy as np
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+
+OPTION_CONTRACT_MULTIPLIER = 100  # shares represented per option contract
+DEFAULT_POSITIONS_STORE = "alpaca_sandbox_positions.json"
 
 
 class OptionsDataFetcher(Protocol):
@@ -474,7 +479,7 @@ class OptionsBuyStrategy:
             'entry_price': opportunity['metrics']['mid_price'],
             'entry_date': datetime.now(),
             'position_size': position_size,
-            'max_risk': opportunity['metrics']['mid_price'] * position_size,
+            'max_risk': opportunity['metrics']['mid_price'] * position_size * OPTION_CONTRACT_MULTIPLIER,
             'profit_target': opportunity['metrics']['mid_price'] * self.criteria.profit_target_multiplier,
             'stop_loss': opportunity['metrics']['mid_price'] * self.criteria.stop_loss_multiplier,
             'status': 'open',
@@ -535,7 +540,11 @@ class OptionsBuyStrategy:
                     continue
                 
                 # Calculate current P&L
-                current_pnl = (current_price - position['entry_price']) * position['position_size']
+                current_pnl = (
+                    (current_price - position['entry_price'])
+                    * position['position_size']
+                    * OPTION_CONTRACT_MULTIPLIER
+                )
                 position['current_pnl'] = current_pnl
                 
                 # Check exit conditions
@@ -576,6 +585,10 @@ class OptionsBuyStrategy:
             print(f"Error getting current option price: {e}")
             return None
     
+    def evaluate_exit(self, position: Dict, current_price: float) -> Optional[str]:
+        """Public entry point for exit-condition checks against an externally-sourced current price."""
+        return self._should_exit_position(position, current_price)
+
     def _should_exit_position(self, position: Dict, current_price: float) -> Optional[str]:
         """Determine if position should be exited"""
         current_pnl = (current_price - position['entry_price']) * position['position_size']
@@ -678,7 +691,11 @@ class OptionsBuyStrategy:
             position['exit_date'] = datetime.now()
             position['exit_reason'] = exit_reason
             position['status'] = 'closed'
-            position['final_pnl'] = (current_price - position['entry_price']) * position['position_size']
+            position['final_pnl'] = (
+                (current_price - position['entry_price'])
+                * position['position_size']
+                * OPTION_CONTRACT_MULTIPLIER
+            )
             
             # Move to closed positions
             self.open_positions.remove(position)
@@ -692,6 +709,39 @@ class OptionsBuyStrategy:
         except Exception as e:
             print(f"Error closing position: {e}")
             return False
+
+    def save_positions(self, path: str = DEFAULT_POSITIONS_STORE) -> None:
+        """Persist open/closed positions to disk so they survive across separate CLI runs."""
+        def _default(value: Any) -> str:
+            if isinstance(value, datetime):
+                return value.isoformat()
+            return str(value)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"open_positions": self.open_positions, "closed_positions": self.closed_positions},
+                f,
+                indent=2,
+                default=_default,
+            )
+
+    def load_positions(self, path: str = DEFAULT_POSITIONS_STORE) -> None:
+        """Load previously persisted open/closed positions, if present."""
+        if not os.path.exists(path):
+            return
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        def _parse_dates(position: Dict) -> Dict:
+            for key in ("entry_date", "exit_date"):
+                value = position.get(key)
+                if isinstance(value, str):
+                    position[key] = datetime.fromisoformat(value)
+            return position
+
+        self.open_positions = [_parse_dates(p) for p in data.get("open_positions", [])]
+        self.closed_positions = [_parse_dates(p) for p in data.get("closed_positions", [])]
 
 if __name__ == '__main__':
     try:

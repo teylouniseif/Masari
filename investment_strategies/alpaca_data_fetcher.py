@@ -322,12 +322,23 @@ class AlpacaDataFetcher:
         return {"optionChain": option_chain, "options": option_chain}
 
     def get_option_chain(self, symbol: str) -> Dict[str, Any]:
-        data = self._data_request(
-            "GET",
-            f"v1beta1/options/snapshots/{symbol}",
-            params={"feed": "indicative"},
-        )
-        snapshots = data.get("snapshots", {})
+        snapshots: Dict[str, Any] = {}
+        params: Dict[str, Any] = {"feed": "indicative", "limit": 1000}
+        page_token: Optional[str] = None
+
+        while True:
+            if page_token:
+                params["page_token"] = page_token
+            data = self._data_request(
+                "GET",
+                f"v1beta1/options/snapshots/{symbol}",
+                params=params,
+            )
+            snapshots.update(data.get("snapshots", {}))
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
         return self._normalize_option_snapshots(snapshots)
 
     def get_option_contracts(
@@ -407,6 +418,57 @@ class AlpacaDataFetcher:
             "snapshots": snapshots,
         }
 
+    def get_option_bars(
+        self,
+        option_symbols: List[str],
+        timeframe: str = "1Hour",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        limit: int = 1000,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        if not start:
+            start = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if not end:
+            end = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for chunk in self._chunked(option_symbols, 100):
+            if not chunk:
+                continue
+            try:
+                data = self._data_request(
+                    "GET",
+                    "v1beta1/options/bars",
+                    params={
+                        "symbols": ",".join(chunk),
+                        "timeframe": timeframe,
+                        "start": start,
+                        "end": end,
+                        "limit": limit,
+                    },
+                )
+            except Exception as exc:
+                if "403" in str(exc):
+                    raise PermissionError(
+                        "options/bars requires an Alpaca data subscription upgrade (403 Forbidden)"
+                    ) from exc
+                raise
+            for symbol, bars in data.get("bars", {}).items():
+                result[symbol] = [
+                    {
+                        "timestamp": bar.get("t"),
+                        "open": bar.get("o", 0.0),
+                        "high": bar.get("h", 0.0),
+                        "low": bar.get("l", 0.0),
+                        "close": bar.get("c", 0.0),
+                        "volume": bar.get("v", 0),
+                        "tradeCount": bar.get("n", 0),
+                        "vwap": bar.get("vw", 0.0),
+                    }
+                    for bar in bars
+                ]
+        return result
+
     def get_order_impact(self, account_id: str, order_payload: Dict[str, Any]) -> Dict[str, Any]:
         qty = float(order_payload.get("qty") or order_payload.get("quantity") or 0)
         price = float(order_payload.get("limit_price") or order_payload.get("limitPrice") or 0)
@@ -423,3 +485,14 @@ class AlpacaDataFetcher:
 
     def place_order(self, account_id: str, order_payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._request("POST", "v2/orders", payload=order_payload)
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        return self._request("GET", "v2/positions")
+
+    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self._request("GET", f"v2/positions/{symbol}")
+        except HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
