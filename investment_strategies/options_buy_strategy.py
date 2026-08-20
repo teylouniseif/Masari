@@ -368,7 +368,7 @@ class OptionsBuyStrategy:
                     continue
                 
                 # Calculate opportunity score
-                score = 0#self._calculate_opportunity_score(option, metrics, rsi, momentum)
+                score = self._calculate_opportunity_score(option, metrics, rsi, momentum)
                 
                 best_opportunities.append({
                     'option': option,
@@ -437,9 +437,7 @@ class OptionsBuyStrategy:
             score += 10
         if option['open_interest'] > 1000:
             score += 10
-            
-        score = 80
-        
+
         return max(0, score)  # Don't allow negative scores
     
     def find_best_opportunities(self, symbols: List[str]) -> List[Dict]:
