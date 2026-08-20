@@ -105,7 +105,6 @@ def main() -> None:
     for idx, opp in enumerate(opportunities[: args.max_orders], start=1):
         result = executor.execute_opportunity(
             opp,
-            quantity=1,
             submit_order=args.submit,
             preview_impact=True,
         )

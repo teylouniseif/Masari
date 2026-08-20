@@ -1,9 +1,18 @@
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .alpaca_data_fetcher import AlpacaDataFetcher
-from .options_buy_strategy import OptionsBuyStrategy
+from .options_buy_strategy import OPTION_CONTRACT_MULTIPLIER, OptionsBuyStrategy
+
+# OCC-style option symbol: root ticker + YYMMDD + C/P + 8-digit strike, e.g. AAPL260819C00205000
+_OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$")
+
+
+def _underlying_symbol(option_symbol: str) -> Optional[str]:
+    match = _OPTION_SYMBOL_RE.match(option_symbol)
+    return match.group(1) if match else None
 
 
 @dataclass
@@ -27,6 +36,49 @@ class AlpacaOptionsPlaySandboxExecutor:
         self.strategy = strategy
         account = self.data_fetcher.ensure_paper_account()
         self.account_id = account.get("account_number", "paper")
+
+    def _has_open_exposure(self, underlying_symbol: str) -> bool:
+        """
+        True if we already hold a position, or have a working (unfilled) order,
+        on any option contract for this underlying. Prevents piling into the
+        same name repeatedly across scans/scheduled runs before a prior order
+        has even filled or been reconciled.
+        """
+        for position in self.data_fetcher.get_positions():
+            if _underlying_symbol(position.get("symbol", "")) == underlying_symbol:
+                return True
+
+        open_orders = self.data_fetcher._request(
+            "GET", "v2/orders", params={"status": "open", "limit": 500}
+        )
+        for order in open_orders:
+            if _underlying_symbol(order.get("symbol", "")) == underlying_symbol:
+                return True
+
+        return False
+
+    def _calculate_quantity(self, limit_price: float) -> int:
+        """
+        Size the order so max risk (premium paid is the full risk on a long
+        option) stays within criteria.max_risk_per_trade percent of account
+        equity, and never exceeds available buying power.
+        """
+        if self.strategy is None or limit_price <= 0:
+            return 1
+
+        per_contract_cost = limit_price * OPTION_CONTRACT_MULTIPLIER
+        if per_contract_cost <= 0:
+            return 0
+
+        account = self.data_fetcher.get_account()
+        equity = float(account.get("equity", 0.0))
+        buying_power = float(account.get("buying_power", 0.0))
+
+        risk_budget = equity * (self.strategy.criteria.max_risk_per_trade / 100.0)
+        by_risk = int(risk_budget // per_contract_cost)
+        by_buying_power = int(buying_power // per_contract_cost)
+
+        return max(min(by_risk, by_buying_power), 0)
 
     def _collect_option_candidates(self, symbol: str) -> List[Dict[str, Any]]:
         chain = self.data_fetcher.get_option_chain(symbol)
@@ -114,7 +166,7 @@ class AlpacaOptionsPlaySandboxExecutor:
     def execute_opportunity(
         self,
         opportunity: Dict[str, Any],
-        quantity: int = 1,
+        quantity: Optional[int] = None,
         submit_order: bool = False,
         preview_impact: bool = True,
         time_in_force: str = "day",
@@ -122,6 +174,17 @@ class AlpacaOptionsPlaySandboxExecutor:
         symbol = opportunity["symbol"]
         option = opportunity["option"]
         metrics = opportunity.get("metrics", {})
+
+        if submit_order and self._has_open_exposure(symbol):
+            return AlpacaSandboxOrderResult(
+                account_id=self.account_id,
+                payload={},
+                error=(
+                    f"Skipping {symbol}: already have an open position or working order "
+                    "on this underlying. Close/cancel it first, or let it resolve, before "
+                    "opening another."
+                ),
+            )
 
         try:
             resolved = self._resolve_option_contract(
@@ -134,6 +197,15 @@ class AlpacaOptionsPlaySandboxExecutor:
             limit = resolved["ask"] if resolved["ask"] > 0 else metrics.get("mid_price", 0)
             if limit <= 0:
                 raise ValueError("Could not determine a valid limit price for the option order.")
+
+            if quantity is None:
+                quantity = self._calculate_quantity(limit)
+                if quantity < 1:
+                    raise ValueError(
+                        f"Sizing to {self.strategy.criteria.max_risk_per_trade}% max risk per "
+                        f"trade yields 0 contracts at ${limit:.2f}/contract given current "
+                        "account equity/buying power."
+                    )
 
             payload = self._build_order_payload(
                 option_symbol=resolved["option_symbol"],

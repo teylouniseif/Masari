@@ -44,7 +44,9 @@ class OptionsBuyCriteria:
     min_market_cap: float = 1_000_000_000  # $1B
     
     # Options Criteria
-    min_days_to_expiry: int = 0  # Minimum 3 weeks
+    min_days_to_expiry: int = 7  # TESTING value — raise to 21 (3 weeks) before going live.
+    # Must stay > 5: the time-decay exit fires at (dte_at_entry - days_held) <= 5,
+    # so anything at/below 5 forces an exit almost immediately after entry.
     max_days_to_expiry: int = 45  # Maximum 6.5 weeks
     min_option_volume: int = 100
     min_open_interest: int = 200
@@ -600,9 +602,9 @@ class OptionsBuyStrategy:
         if current_price <= position['stop_loss']:
             return "Stop Loss Hit"
         
-        # Time decay exit (close within 7 days of expiry)
+        # Time decay exit (close within 5 days of expiry)
         days_held = (datetime.now() - position['entry_date']).days
-        if position['dte'] - days_held <= 7:
+        if position['dte'] - days_held <= 5:
             return "Time Decay Exit"
         
         # High profit exit (50% profit)
