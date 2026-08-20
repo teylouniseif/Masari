@@ -19,6 +19,7 @@ from investment_strategies.options_buy_strategy import (
     DEFAULT_POSITIONS_STORE,
     OptionsBuyStrategy,
 )
+from investment_strategies.stock_screener import StockScreener
 
 
 def main() -> None:
@@ -34,8 +35,8 @@ def main() -> None:
     parser.add_argument(
         "--symbols",
         nargs="+",
-        default=["AAPL", "MSFT", "NVDA", "TSLA"],
-        help="Symbols to scan.",
+        default=None,
+        help="Symbols to scan. Defaults to the full S&P 500 (fetched from Wikipedia).",
     )
     parser.add_argument(
         "--max-orders",
@@ -95,7 +96,17 @@ def main() -> None:
         strategy.save_positions(args.positions_file)
         return
 
-    opportunities = strategy.find_best_opportunities(args.symbols)
+    symbols = args.symbols
+    if symbols is None:
+        sp500 = StockScreener(alpaca_fetcher).get_sp500_stocks()
+        if sp500.empty:
+            print("Could not fetch S&P 500 list; falling back to a small default set.")
+            symbols = ["AAPL", "MSFT", "NVDA", "TSLA"]
+        else:
+            symbols = sp500["Symbol"].tolist()
+    print(f"Scanning {len(symbols)} symbol(s).")
+
+    opportunities = strategy.find_best_opportunities(symbols)
     if not opportunities:
         print("No opportunities found.")
         strategy.save_positions(args.positions_file)

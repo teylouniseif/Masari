@@ -4,7 +4,7 @@ What actually runs hourly via cron (`scripts/run_alpaca_sandbox_hourly.sh` → `
 
 ## Pipeline
 
-1. **Scan** (`OptionsBuyStrategy.find_best_opportunities`, symbols default `AAPL MSFT NVDA TSLA`, overridable via `--symbols`)
+1. **Scan** (`OptionsBuyStrategy.find_best_opportunities`, symbols default to the full S&P 500 via `StockScreener.get_sp500_stocks()` scraped from Wikipedia; overridable via `--symbols`). Previously hardcoded to `AAPL MSFT NVDA TSLA` — that was a leftover testing default the cron job never overrode, fixed 2026-08-20. A full 503-symbol scan takes ~10 minutes.
 2. **Filter** each symbol's stock data and full option chain against entry criteria
 3. **Score** surviving candidates
 4. **Size & submit** the top `--max-orders` (default 1) via `AlpacaOptionsPlaySandboxExecutor`

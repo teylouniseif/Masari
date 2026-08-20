@@ -1,4 +1,6 @@
+import io
 import pandas as pd
+import requests
 from typing import List, Dict, Type
 from .questrade_data_fetcher import QuestradeDataFetcher
 from .iron_condor_analyzer import IronCondorAnalyzer
@@ -20,7 +22,10 @@ class StockScreener:
         try:
             print("Fetching S&P 500 stock list from Wikipedia...")
             url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-            table = pd.read_html(url)
+            # Wikipedia's bot policy 403s requests with no/default User-Agent.
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (MasariBot/1.0)"})
+            resp.raise_for_status()
+            table = pd.read_html(io.StringIO(resp.text))
             sp500_df = table[0]
             # Clean up tickers that have a '.' (e.g., BRK.B -> BRK-B)
             sp500_df['Symbol'] = sp500_df['Symbol'].str.replace('.', '-', regex=False)
