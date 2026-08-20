@@ -6,7 +6,7 @@ What actually runs hourly via cron (`scripts/run_alpaca_sandbox_hourly.sh` → `
 
 1. **Scan** (`OptionsBuyStrategy.find_best_opportunities`, symbols default `AAPL MSFT NVDA TSLA`, overridable via `--symbols`)
 2. **Filter** each symbol's stock data and full option chain against entry criteria
-3. **Score** surviving candidates (currently a no-op — see Known Issue below)
+3. **Score** surviving candidates
 4. **Size & submit** the top `--max-orders` (default 1) via `AlpacaOptionsPlaySandboxExecutor`
 5. **Track** the resulting position in `alpaca_sandbox_positions.json`
 6. Separately, `--monitor` mode checks tracked open positions against live prices and sells-to-close on an exit signal
