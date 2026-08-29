@@ -29,6 +29,10 @@ RC_OUTPUT_LOG="$REPO_DIR/logs/claude_rc_session.log"
 PID_FILE="$REPO_DIR/logs/claude_rc.pid"
 LOCK_FILE="$REPO_DIR/logs/claude_rc_watchdog.lock"
 
+# How long to wait for the Remote Control handshake after spawning. Observed
+# connects land in ~5s; the margin is for a slow or retrying control plane.
+RC_CONNECT_TIMEOUT=45
+
 mkdir -p "$REPO_DIR/logs"
 
 log() { echo "$(date -Iseconds)  $*" >> "$LOG_FILE"; }
@@ -59,8 +63,78 @@ is_alive() {
   tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q -- "--remote-control $SESSION_NAME"
 }
 
-if [[ -f "$PID_FILE" ]] && is_alive "$(cat "$PID_FILE" 2>/dev/null || true)"; then
-  exit 0
+# Process liveness is not the same as Remote Control being up. A session whose
+# handshake fails ("Session creation failed") stays alive and idle forever, so
+# a pid-only check reports it healthy and never retries -- one transient
+# server-side failure latches into a permanent outage. Read the actual state
+# out of the session's pty log instead.
+#
+# That log is the raw pty stream, so it is full of cursor-positioning escapes
+# that split words at arbitrary points ("/remote-control[19Gis[22Gactive").
+# Stripping escapes is not enough; the spacing is unreliable too. Flatten all
+# whitespace away and match against the flattened needles.
+#
+# The stream is append-only and a session can connect and later drop, so the
+# marker that appears *last* is the current state, not merely the one present.
+rc_state() {
+  [[ -r "$RC_OUTPUT_LOG" ]] || { echo unknown; return; }
+
+  local flat up_at down_at
+  flat="$(sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$RC_OUTPUT_LOG" 2>/dev/null \
+          | tr -d '[:space:]')"
+
+  up_at="$(printf '%s' "$flat" \
+           | grep -ob -e 'remote-controlisactive' -e 'claude.ai/code/session_' \
+           | tail -1 | cut -d: -f1)"
+  down_at="$(printf '%s' "$flat" \
+             | grep -ob -e 'RemoteControldisconnected' -e 'Sessioncreationfailed' \
+             | tail -1 | cut -d: -f1)"
+
+  if [[ -n "$up_at" && ( -z "$down_at" || "$up_at" -gt "$down_at" ) ]]; then
+    echo connected
+  elif [[ -n "$down_at" ]]; then
+    echo failed
+  else
+    echo unknown
+  fi
+}
+
+# `setsid` makes the spawned process a process-group leader, so the whole
+# script/sh/claude tree is reachable as a negative pid. Fall back to the bare
+# pid for an adopted session, which may not lead its own group.
+stop_session() {
+  local pid="$1"
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  sleep 3
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
+
+# The pid file carries "<pid> <origin>". Origin matters because rc_state reads
+# RC_OUTPUT_LOG, which only describes sessions *we* spawned; for one adopted
+# from a hand-run terminal that log belongs to some earlier session, so its
+# contents would be answering a question about the wrong process. Liveness is
+# all we can honestly assert there. A bare pid (the pre-origin format) is read
+# as launched, which is the recoverable direction.
+if [[ -f "$PID_FILE" ]]; then
+  read -r tracked origin < "$PID_FILE" 2>/dev/null || true
+  if is_alive "${tracked:-}"; then
+    if [[ "${origin:-launched}" == "adopted" ]]; then
+      exit 0
+    fi
+    case "$(rc_state)" in
+      connected)
+        exit 0
+        ;;
+      *)
+        # Alive but with no live Remote Control connection. Tear it down instead
+        # of leaving it parked: it would keep answering the liveness check, and
+        # the adopt sweep below would happily re-adopt the same dead weight.
+        log "session $SESSION_NAME alive but not connected (pid=$tracked); restarting"
+        stop_session "$tracked"
+        rm -f "$PID_FILE"
+        ;;
+    esac
+  fi
 fi
 
 # No tracked session. Adopt one started by hand before starting a duplicate.
@@ -73,7 +147,7 @@ while read -r candidate; do
 done < <(pgrep -f -- "--remote-control $SESSION_NAME" 2>/dev/null || true)
 
 if [[ -n "$existing" ]]; then
-  echo "$existing" > "$PID_FILE"
+  echo "$existing adopted" > "$PID_FILE"
   log "adopted existing session pid=$existing name=$SESSION_NAME"
   exit 0
 fi
@@ -96,15 +170,39 @@ setsid script -qec "claude --remote-control $SESSION_NAME" /dev/null \
   </dev/null >"$RC_OUTPUT_LOG" 2>&1 9>&- &
 pid=$!
 
-echo "$pid" > "$PID_FILE"
+echo "$pid launched" > "$PID_FILE"
 log "started remote control session pid=$pid name=$SESSION_NAME"
 
-# Confirm it actually came up rather than dying on a bad login/credential.
-sleep 10
-if is_alive "$pid"; then
-  log "session $SESSION_NAME healthy (pid=$pid)"
-else
-  log "ERROR: session $SESSION_NAME exited within 10s; see $RC_OUTPUT_LOG"
-  rm -f "$PID_FILE"
-  exit 1
-fi
+# Confirm Remote Control actually connected -- not merely that the process
+# survived. Spawning succeeds even when the handshake is going to fail, so
+# waiting on liveness alone is what previously reported a dead session healthy.
+deadline=$((SECONDS + RC_CONNECT_TIMEOUT))
+state=unknown
+while (( SECONDS < deadline )); do
+  if ! is_alive "$pid"; then
+    state=exited
+    break
+  fi
+  state="$(rc_state)"
+  [[ "$state" == "connected" || "$state" == "failed" ]] && break
+  sleep 2
+done
+
+case "$state" in
+  connected)
+    log "session $SESSION_NAME connected (pid=$pid)"
+    ;;
+  exited)
+    log "ERROR: session $SESSION_NAME exited during startup; see $RC_OUTPUT_LOG"
+    rm -f "$PID_FILE"
+    exit 1
+    ;;
+  *)
+    # Includes the transient control-plane "Session creation failed". Reap it so
+    # the next tick starts clean rather than adopting a connectionless session.
+    log "ERROR: session $SESSION_NAME did not connect (state=$state); see $RC_OUTPUT_LOG"
+    stop_session "$pid"
+    rm -f "$PID_FILE"
+    exit 1
+    ;;
+esac
