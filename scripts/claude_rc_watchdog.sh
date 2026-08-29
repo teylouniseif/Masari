@@ -17,6 +17,11 @@
 #
 set -euo pipefail
 
+# cron runs with a minimal PATH (typically /usr/bin:/bin), which does not
+# include ~/.local/bin where claude is installed. Without this the launch fails
+# with "claude: command not found" and the box silently stays unreachable.
+export PATH="${HOME:-/home/saif}/.local/bin:$PATH"
+
 REPO_DIR="/home/saif/AI/Masari"
 SESSION_NAME="${CLAUDE_RC_SESSION_NAME:-$(hostname -s)-rc}"
 LOG_FILE="$REPO_DIR/logs/claude_rc_watchdog.log"
@@ -82,8 +87,13 @@ unset CLAUDE_CODE_CHILD_SESSION
 
 # `script -qec CMD /dev/null` runs CMD on a pty and discards the typescript;
 # the session's own (ANSI-heavy) output goes to RC_OUTPUT_LOG for debugging.
+#
+# `9>&-` closes the lock fd in the child. Without it the long-lived session
+# inherits fd 9 and holds the flock for its entire life, so every later run
+# fails `flock -n` and exits before it can check anything -- the watchdog goes
+# permanently blind while looking like it is working.
 setsid script -qec "claude --remote-control $SESSION_NAME" /dev/null \
-  </dev/null >"$RC_OUTPUT_LOG" 2>&1 &
+  </dev/null >"$RC_OUTPUT_LOG" 2>&1 9>&- &
 pid=$!
 
 echo "$pid" > "$PID_FILE"
