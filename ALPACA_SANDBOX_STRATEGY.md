@@ -40,6 +40,24 @@ Both calls and puts are evaluated per strike; RSI(14) and a 20-day momentum scor
 
 `_calculate_opportunity_score` scores each candidate from RSI alignment, momentum, risk/reward, probability of profit, time-value ratio, and volume/OI. It was silently disabled from 2026-03-25 (commit `01cee69`, "adding sandbox") through 2026-08-20 via two hardcoded overrides bundled into an unrelated 1200-line commit with no explanation: `score = 0` in `analyze_stock_for_options`, and the scorer itself overwriting its own result with `score = 80` on its last line. For ~5 months, every hourly run picked "first suitable contract found," not the best one. **Re-enabled 2026-08-20** — both overrides removed.
 
+## Rate limiting
+
+Alpaca allows **200 requests/min per API key**, metered separately for the trading API (`paper-api.alpaca.markets`) and the market data API (`data.alpaca.markets`) — both 200/min on the free Basic plan.
+
+A full 503-symbol scan issues roughly **1,800 data requests** (quote + 100-day bars + 1–4 pages of option snapshots per symbol) and **760 trading requests** (1–4 pages of `v2/options/contracts` for the open-interest merge). Measured on a 60-symbol sample, the unthrottled scan ran at ~240 data req/min — *over* the limit. Because `_get_option_chain_analysis` catches every exception and `find_best_opportunities` silently drops symbols that return an error, a 429 does not surface anywhere: the symbol just vanishes from the scan.
+
+`AlpacaDataFetcher` now paces itself in `_request`, the single choke point every call goes through:
+
+- **Sliding-window limiter, one bucket per host** (`_RateLimiter`), default 190/min — a small margin under 200 to absorb clock skew between our window and Alpaca's. Trading and data hosts each get their own bucket, matching how Alpaca meters them.
+- **Retry with exponential backoff + jitter** on 429 and 5xx (a 503 on `v2/account` has been seen in the cron log), plus connection errors/timeouts. Defaults: 5 retries, 1s base, doubling, capped at 60s. Jitter prevents a throttled batch from retrying in lockstep.
+- **Server-directed delays win** — `Retry-After` (seconds or HTTP date) and `X-RateLimit-Reset` (epoch seconds) are honored over the computed backoff.
+- **A 429 parks the whole host bucket**, not just the calling request, so queued work doesn't walk straight into another 429.
+- 401 still raises the credential-hint `ValueError` immediately, and non-retryable 4xx (e.g. 404 from `get_position`) still raise on the first attempt — the retry loop doesn't mask them.
+
+All four knobs are constructor arguments (`requests_per_minute`, `max_retries`, `backoff_base_seconds`, `backoff_cap_seconds`); raising `requests_per_minute` toward 10,000 is the one change needed on an Algo Trader Plus data plan.
+
+**Runtime cost:** the data bucket is the binding constraint at ~1,800 requests. At 190/min that is a **~9.5 minute floor**, versus ~7.7 min unthrottled — the scan gets a couple of minutes slower but stops silently losing symbols. A measured 60-symbol run held a peak of 190 in any rolling 60s window and projected to **~9 minutes** for the full 503. That still fits inside the hourly cron window, but the margin is now ~50 minutes rather than ~52 — worth remembering if the universe grows past the S&P 500 or per-symbol request counts rise. Scoping the snapshot fetch to the 7–45 DTE window the strategy actually uses (instead of pulling every expiry, ~22 for the megacaps) would cut the request count several-fold if more headroom is ever needed.
+
 ## Position sizing
 
 Long options only (`buy_to_open`), sized by `AlpacaOptionsPlaySandboxExecutor._calculate_quantity`:
@@ -83,3 +101,5 @@ If a tracked position is no longer held at Alpaca at all (expired, exercised, or
 - `min_market_cap` criterion is defined but never checked.
 - No hard cap on total concurrent open positions or aggregate portfolio risk — only per-underlying dedup.
 - `min_days_to_expiry=7` is explicitly a placeholder per its own code comment.
+- Per-symbol scan failures are swallowed: `_get_option_chain_analysis` returns `{'error': ...}` for any exception and `find_best_opportunities` drops those symbols without logging. A scan that silently covered 300 of 503 symbols looks identical to a clean one.
+- `BRK-B` (and any other dotted-class ticker) 400s against the data API, which expects `BRK.B`. The Wikipedia S&P 500 scrape yields the hyphenated form, so these symbols are silently dropped from every scan.

@@ -1,18 +1,80 @@
 import json
 import os
+import random
 import re
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Deque, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import requests
 from requests.auth import _basic_auth_str
-from requests.exceptions import HTTPError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import HTTPError, Timeout
 
 ALPACA_CREDENTIALS_FILE = "alpaca_credentials.json"
 DEFAULT_PAPER_TRADING_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DATA_URL = "https://data.alpaca.markets"
 DEFAULT_BROKER_SANDBOX_URL = "https://broker-api.sandbox.alpaca.markets"
+
+# Alpaca allows 200 requests/min per API key, counted separately for the trading
+# API and the market data API (both 200/min on the free Basic plan). Default to a
+# little under that so clock skew between our window and Alpaca's does not push us
+# over the edge.
+DEFAULT_REQUESTS_PER_MINUTE = 190
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+# Retried transient statuses: 429 is the rate limiter; 5xx are the intermittent
+# gateway failures Alpaca returns under load (a 503 on v2/account has been seen
+# in the hourly cron log).
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+class _RateLimiter:
+    """
+    Sliding-window limiter: at most `limit` acquisitions per `window` seconds.
+
+    One instance per API host, since Alpaca meters the trading and market data
+    APIs independently. `block()` parks the whole bucket, so a 429 on one request
+    also holds back every later request to that host rather than letting them
+    queue straight into another 429.
+    """
+
+    def __init__(self, limit: int, window: float = RATE_LIMIT_WINDOW_SECONDS):
+        self.limit = max(1, limit)
+        self.window = window
+        self._hits: Deque[float] = deque()
+        self._blocked_until = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+
+                if now < self._blocked_until:
+                    sleep_for = self._blocked_until - now
+                else:
+                    while self._hits and now - self._hits[0] >= self.window:
+                        self._hits.popleft()
+                    if len(self._hits) < self.limit:
+                        self._hits.append(now)
+                        return
+                    # Wait for the oldest hit to age out of the window.
+                    sleep_for = self.window - (now - self._hits[0])
+
+            time.sleep(max(sleep_for, 0.01))
+
+    def block(self, seconds: float) -> None:
+        """Hold every request to this host for `seconds` (used after a 429)."""
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._blocked_until = max(self._blocked_until, time.monotonic() + seconds)
 
 
 @dataclass
@@ -61,10 +123,20 @@ class AlpacaDataFetcher:
         credentials_file: str = ALPACA_CREDENTIALS_FILE,
         data_feed: str = "iex",
         timeout_seconds: int = 20,
+        requests_per_minute: int = DEFAULT_REQUESTS_PER_MINUTE,
+        max_retries: int = 5,
+        backoff_base_seconds: float = 1.0,
+        backoff_cap_seconds: float = 60.0,
     ):
         self.credentials_file = credentials_file
         self.timeout_seconds = timeout_seconds
         self.data_feed = data_feed
+        self.requests_per_minute = requests_per_minute
+        self.max_retries = max_retries
+        self.backoff_base_seconds = backoff_base_seconds
+        self.backoff_cap_seconds = backoff_cap_seconds
+        self._rate_limiters: Dict[str, _RateLimiter] = {}
+        self._rate_limiter_lock = threading.Lock()
 
         loaded = self._load_credentials(credentials_file)
         self.credentials = credentials or loaded
@@ -104,6 +176,52 @@ class AlpacaDataFetcher:
         )
         return " ".join(hints)
 
+    def _limiter_for(self, url: str) -> _RateLimiter:
+        """One limiter per host: Alpaca meters trading/data/broker separately."""
+        host = urlsplit(url).netloc
+        with self._rate_limiter_lock:
+            limiter = self._rate_limiters.get(host)
+            if limiter is None:
+                limiter = _RateLimiter(self.requests_per_minute)
+                self._rate_limiters[host] = limiter
+            return limiter
+
+    def _retry_delay(self, attempt: int, response: Optional[requests.Response]) -> float:
+        """
+        How long to wait before retry number `attempt` (0-based).
+
+        Prefers whatever the server asked for -- `Retry-After` (seconds or an
+        HTTP date) or Alpaca's `X-RateLimit-Reset` (epoch seconds) -- and falls
+        back to exponential backoff. Jitter is always added so that a batch of
+        callers that got throttled together does not retry in lockstep.
+        """
+        server_delay = 0.0
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    server_delay = float(retry_after)
+                except ValueError:
+                    try:
+                        reset_at = parsedate_to_datetime(retry_after)
+                        if reset_at.tzinfo is None:
+                            reset_at = reset_at.replace(tzinfo=timezone.utc)
+                        server_delay = (reset_at - datetime.now(timezone.utc)).total_seconds()
+                    except (TypeError, ValueError):
+                        server_delay = 0.0
+            if server_delay <= 0:
+                reset_epoch = response.headers.get("X-RateLimit-Reset")
+                if reset_epoch:
+                    try:
+                        server_delay = float(reset_epoch) - time.time()
+                    except ValueError:
+                        server_delay = 0.0
+
+        backoff = self.backoff_base_seconds * (2**attempt)
+        delay = max(server_delay, backoff)
+        delay = min(delay, self.backoff_cap_seconds)
+        return max(delay, 0.0) + random.uniform(0, self.backoff_base_seconds)
+
     def _request(
         self,
         method: str,
@@ -115,24 +233,50 @@ class AlpacaDataFetcher:
     ) -> Dict[str, Any]:
         url = f"{(base_url or self.credentials.trading_base_url).rstrip('/')}/{path.lstrip('/')}"
         req_headers = headers or self._headers()
-        response = requests.request(
-            method=method.upper(),
-            url=url,
-            headers=req_headers,
-            params=params,
-            json=payload,
-            timeout=self.timeout_seconds,
-        )
-        try:
-            response.raise_for_status()
-        except HTTPError as exc:
-            if response.status_code == 401:
-                message = self._build_unauthorized_hint(url)
-                raise ValueError(message) from exc
-            raise
-        if not response.text:
-            return {}
-        return response.json()
+        limiter = self._limiter_for(url)
+
+        for attempt in range(self.max_retries + 1):
+            limiter.acquire()
+
+            try:
+                response = requests.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=req_headers,
+                    params=params,
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                )
+            except (RequestsConnectionError, Timeout):
+                # Nothing to learn from headers here; back off and try again.
+                if attempt >= self.max_retries:
+                    raise
+                time.sleep(self._retry_delay(attempt, None))
+                continue
+
+            try:
+                response.raise_for_status()
+            except HTTPError as exc:
+                if response.status_code == 401:
+                    message = self._build_unauthorized_hint(url)
+                    raise ValueError(message) from exc
+                if response.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, response)
+                    if response.status_code == 429:
+                        # Park the whole host, not just this call, so in-flight
+                        # work does not walk straight into another 429.
+                        limiter.block(delay)
+                    else:
+                        time.sleep(delay)
+                    continue
+                raise
+
+            if not response.text:
+                return {}
+            return response.json()
+
+        # Unreachable: the final attempt either returns or re-raises above.
+        raise RuntimeError(f"Exhausted retries for {method.upper()} {url}")
 
     def _data_request(
         self,
