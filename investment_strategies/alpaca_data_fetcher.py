@@ -273,7 +273,12 @@ class AlpacaDataFetcher:
             "expiry_date": expiry.strftime("%Y-%m-%dT00:00:00Z"),
         }
 
-    def _normalize_option_snapshots(self, snapshots: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_option_snapshots(
+        self,
+        snapshots: Dict[str, Any],
+        open_interest_map: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        open_interest_map = open_interest_map or {}
         grouped: Dict[str, Dict[float, Dict[str, Any]]] = {}
 
         for option_symbol, snapshot in snapshots.items():
@@ -294,7 +299,11 @@ class AlpacaDataFetcher:
                 "bid": quote.get("bp", 0.0) or 0.0,
                 "ask": quote.get("ap", 0.0) or 0.0,
                 "volume": day_bar.get("v", snapshot.get("volume", 0)) or 0,
-                "openInterest": snapshot.get("open_interest", 0) or 0,
+                # Open interest is not carried on the snapshots endpoint at all; it is
+                # only exposed per-contract by v2/options/contracts, so it is merged in
+                # from there. Reading it off the snapshot always yielded 0, which meant
+                # every contract failed min_open_interest and no trade ever qualified.
+                "openInterest": open_interest_map.get(option_symbol, 0) or 0,
                 "impliedVolatility": snapshot.get("impliedVolatility", 0) or 0,
                 "delta": greeks.get("delta"),
                 "gamma": greeks.get("gamma"),
@@ -321,6 +330,55 @@ class AlpacaDataFetcher:
 
         return {"optionChain": option_chain, "options": option_chain}
 
+    def get_open_interest_map(
+        self,
+        underlying_symbol: str,
+        expiration_date_gte: Optional[str] = None,
+        expiration_date_lte: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """
+        Map option symbol -> open interest, sourced from v2/options/contracts.
+
+        Open interest is absent from the options snapshots endpoint on every feed,
+        so it has to be fetched separately and merged into the chain. Contracts
+        without a reported open interest are omitted rather than defaulted to 0.
+
+        The expiry bounds matter: an unbounded query returns a truncated single
+        page with no continuation token (~378 of AAPL's ~1600 contracts), while a
+        date-scoped query paginates correctly. Callers should pass the range they
+        actually care about.
+        """
+        open_interest: Dict[str, int] = {}
+        params: Dict[str, Any] = {
+            "underlying_symbols": underlying_symbol,
+            "status": "active",
+            "limit": 1000,
+        }
+        if expiration_date_gte:
+            params["expiration_date_gte"] = expiration_date_gte
+        if expiration_date_lte:
+            params["expiration_date_lte"] = expiration_date_lte
+        page_token: Optional[str] = None
+
+        while True:
+            if page_token:
+                params["page_token"] = page_token
+            data = self._request("GET", "v2/options/contracts", params=params)
+            for contract in data.get("option_contracts", []):
+                raw = contract.get("open_interest")
+                option_symbol = contract.get("symbol")
+                if raw is None or not option_symbol:
+                    continue
+                try:
+                    open_interest[option_symbol] = int(raw)
+                except (TypeError, ValueError):
+                    continue
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
+        return open_interest
+
     def get_option_chain(self, symbol: str) -> Dict[str, Any]:
         snapshots: Dict[str, Any] = {}
         params: Dict[str, Any] = {"feed": "indicative", "limit": 1000}
@@ -339,7 +397,26 @@ class AlpacaDataFetcher:
             if not page_token:
                 break
 
-        return self._normalize_option_snapshots(snapshots)
+        # Scope the open-interest lookup to the expiries actually present in the
+        # chain, since an unbounded contracts query silently truncates.
+        expiries = sorted(
+            parsed["expiry"]
+            for parsed in (
+                self._parse_option_symbol(option_symbol) for option_symbol in snapshots
+            )
+            if parsed
+        )
+        open_interest_map = (
+            self.get_open_interest_map(
+                symbol,
+                expiration_date_gte=expiries[0].strftime("%Y-%m-%d"),
+                expiration_date_lte=expiries[-1].strftime("%Y-%m-%d"),
+            )
+            if expiries
+            else {}
+        )
+
+        return self._normalize_option_snapshots(snapshots, open_interest_map)
 
     def get_option_contracts(
         self,

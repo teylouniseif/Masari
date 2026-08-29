@@ -56,6 +56,14 @@ class OptionsBuyCriteria:
     min_implied_volatility: float = 0.15  # 15% minimum
     max_implied_volatility: float = 0.80  # 80% maximum
     volatility_percentile_min: float = 20  # IV in bottom 20% (cheap options)
+
+    # Moneyness / Delta Criteria
+    # Constrains contracts to a directional-leverage sweet spot. Without this,
+    # nothing stops the scanner from picking deep-ITM contracts that are almost
+    # pure intrinsic value (little leverage, and often too expensive to size
+    # under max_risk_per_trade at all).
+    min_delta: float = 0.30
+    max_delta: float = 0.70
     
     # Technical Criteria
     momentum_period: int = 20
@@ -113,7 +121,7 @@ class OptionsBuyStrategy:
         normalized_momentum = 1 / (1 + np.exp(-momentum * 10))
         return normalized_momentum
     
-    def _get_option_chain_analysis(self, symbol: str) -> Dict:
+    def _get_option_chain_analysis(self, symbol: str, current_price: float) -> Dict:
         """Get and analyze option chain for a symbol"""
         try:
             option_chain = self.data_fetcher.get_option_chain(symbol)
@@ -137,7 +145,9 @@ class OptionsBuyStrategy:
                             
                             # Analyze calls
                             call_data = self._resolve_option_leg_data(strike_data, "call", option_quote_lookup)
-                            if call_data and self._is_option_suitable(call_data, strike_price):
+                            if call_data and self._is_option_suitable(
+                                call_data, strike_price, "call", current_price, dte
+                            ):
                                 suitable_options.append({
                                     'type': 'call',
                                     'strike': strike_price,
@@ -151,7 +161,9 @@ class OptionsBuyStrategy:
 
                             # Analyze puts
                             put_data = self._resolve_option_leg_data(strike_data, "put", option_quote_lookup)
-                            if put_data and self._is_option_suitable(put_data, strike_price):
+                            if put_data and self._is_option_suitable(
+                                put_data, strike_price, "put", current_price, dte
+                            ):
                                 suitable_options.append({
                                     'type': 'put',
                                     'strike': strike_price,
@@ -218,33 +230,50 @@ class OptionsBuyStrategy:
 
         return quote_lookup.get(int(symbol_id), {})
     
-    def _is_option_suitable(self, option_data: Dict, strike_price: float) -> bool:
+    def _is_option_suitable(
+        self,
+        option_data: Dict,
+        strike_price: float,
+        option_type: str,
+        current_price: float,
+        dte: int,
+    ) -> bool:
         """Check if an individual option meets our criteria"""
         bid = option_data.get('bid', 0)
         ask = option_data.get('ask', 0)
         volume = option_data.get('volume', 0)
         open_interest = option_data.get('openInterest', 0)
-        iv = option_data.get('volatility', 0)
+        iv = option_data.get('impliedVolatility', option_data.get('volatility', 0))
 
         if bid <= 0 or ask <= 0:
             return False
-        
+
         # Check bid-ask spread
         spread = (ask - bid) / ask
         if spread > self.criteria.max_bid_ask_spread:
             return False
-        
+
         # Check volume and open interest
         if volume < self.criteria.min_option_volume:
             return False
-        
+
         if open_interest < self.criteria.min_open_interest:
             return False
-        
+
         # Check implied volatility
         if iv < self.criteria.min_implied_volatility or iv > self.criteria.max_implied_volatility:
             return False
-        
+
+        # Check moneyness via delta: excludes deep-ITM contracts (almost pure
+        # intrinsic value, little leverage, often too expensive to size under
+        # max_risk_per_trade) and deep-OTM contracts (low probability of profit).
+        if option_type == 'call':
+            delta = self._calculate_call_delta(current_price, strike_price, iv, dte)
+        else:
+            delta = -self._calculate_put_delta(current_price, strike_price, iv, dte)  # magnitude: put_delta is <= 0
+        if delta < self.criteria.min_delta or delta > self.criteria.max_delta:
+            return False
+
         return True
     
     def _calculate_option_metrics(self, symbol: str, option: Dict, current_price: float) -> Dict:
@@ -352,7 +381,7 @@ class OptionsBuyStrategy:
             momentum = self._calculate_momentum(prices, self.criteria.momentum_period)
             
             # Get option chain analysis
-            option_analysis = self._get_option_chain_analysis(symbol)
+            option_analysis = self._get_option_chain_analysis(symbol, current_price)
             if 'error' in option_analysis:
                 return {'symbol': symbol, 'error': option_analysis['error']}
             

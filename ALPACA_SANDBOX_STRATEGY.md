@@ -28,10 +28,13 @@ What actually runs hourly via cron (`scripts/run_alpaca_sandbox_hourly.sh` → `
 | Open interest | ≥ 200 |
 | Bid/ask spread | ≤ 20% of ask |
 | Implied volatility | 15%–80% |
+| Delta (magnitude) | 0.30–0.70 |
 
 ⚠️ `min_days_to_expiry = 7` is marked in-code as a **testing value**; the comment says raise to 21 before going live. It must stay above 5, since the time-decay exit fires at `dte_at_entry - days_held <= 5` — anything entered at ≤5 DTE exits almost immediately.
 
 Both calls and puts are evaluated per strike; RSI(14) and a 20-day momentum score feed the scoring function below.
+
+**Delta/moneyness filter** (added 2026-08-20): before this, nothing constrained how far the strike could be from spot. In practice the scanner kept picking deep-ITM contracts (e.g. an AAPL $110 call priced at ~$200 while the stock traded around $310) — almost pure intrinsic value, little real leverage, and often too expensive to size even a single contract under the 2% max-risk-per-trade budget. Now filtered to a 0.30–0.70 delta band (call delta directly; `-put_delta` for puts, since `_calculate_put_delta` returns a negative value) using the existing simplified Black-Scholes delta approximation.
 
 ## Scoring
 
