@@ -707,6 +707,33 @@ class AlpacaDataFetcher:
     def place_order(self, account_id: str, order_payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._request("POST", "v2/orders", payload=order_payload)
 
+    def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Look up a single order by id. Used to tell 'never filled' apart from 'filled, then closed'."""
+        try:
+            return self._request("GET", f"v2/orders/{order_id}")
+        except HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
+    def list_orders(
+        self,
+        symbol: Optional[str] = None,
+        status: str = "all",
+        side: Optional[str] = None,
+        after: Optional[str] = None,
+        direction: str = "asc",
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"status": status, "direction": direction, "limit": limit}
+        if symbol:
+            params["symbols"] = symbol
+        if side:
+            params["side"] = side
+        if after:
+            params["after"] = after
+        return self._request("GET", "v2/orders", params=params)
+
     def get_positions(self) -> List[Dict[str, Any]]:
         return self._request("GET", "v2/positions")
 
