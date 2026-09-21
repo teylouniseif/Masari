@@ -74,7 +74,7 @@ class OptionsBuyCriteria:
     # Position Sizing
     max_risk_per_trade: float = 2.0  # 2% of account
     profit_target_multiplier: float = 2.0  # 2:1 risk/reward
-    stop_loss_multiplier: float = 0.5  # 50% loss stop
+    stop_loss_multiplier: float = 0.7  # 30% loss stop
 
 class OptionsBuyStrategy:
     """

@@ -9,8 +9,6 @@ source "$REPO_DIR/.venv/bin/activate"
 
 {
   echo "===== $(date -Iseconds) ====="
-  python test_alpaca_optionsplay_sandbox_execution.py --monitor --submit
-  echo
   python test_alpaca_optionsplay_sandbox_execution.py --submit
   echo
 } >> "$LOG_FILE" 2>&1
