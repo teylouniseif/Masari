@@ -380,7 +380,10 @@ class AlpacaDataFetcher:
 
         params: Dict[str, Any] = {
             "timeframe": timeframe,
-            "adjustment": "raw",
+            # Split/dividend adjusted. Raw bars make a split look like a 200%+
+            # single-day move, which poisons any volatility or momentum figure
+            # derived from the series.
+            "adjustment": "all",
             "feed": self.data_feed,
             "limit": 1000,
         }
