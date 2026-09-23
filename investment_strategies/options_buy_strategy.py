@@ -4,6 +4,7 @@ This strategy identifies optimal entry points for buying options and determines 
 """
 
 import json
+import math
 import os
 import pandas as pd
 import numpy as np
@@ -83,6 +84,15 @@ class OptionsBuyCriteria:
     max_risk_per_trade: float = 2.0  # 2% of account
     profit_target_multiplier: float = 2.0  # 2:1 risk/reward
     stop_loss_multiplier: float = 0.7  # 30% loss stop
+
+    # Scaling out to a free ride.
+    # Expectancy here rests on rare outsized winners, so closing the whole
+    # position at a fixed gain caps the trades that pay for everything else.
+    # Instead, once price reaches scale_out_multiplier, sell only the contracts
+    # needed to take the original cash back off the table and let the rest run
+    # with no target and no stop - it is playing with money already banked.
+    scale_out_multiplier: float = 1.5  # trigger at +50%
+    scale_out_recoup_multiple: float = 1.0  # 1.0 = recover the entry cost exactly
 
 class OptionsBuyStrategy:
     """
@@ -570,9 +580,6 @@ class OptionsBuyStrategy:
     
     def create_position(self, opportunity: Dict, position_size: float = 1.0) -> Dict:
         """Create a new options position"""
-        # Get technical levels for exit signals
-        support_level, resistance_level = self._get_support_resistance_levels(opportunity['symbol'])
-        
         position = {
             'id': f"{opportunity['symbol']}_{opportunity['option']['type']}_{opportunity['option']['strike']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             'symbol': opportunity['symbol'],
@@ -590,46 +597,16 @@ class OptionsBuyStrategy:
             'exit_price': None,
             'exit_date': None,
             'exit_reason': None,
-            # Technical levels for exit signals
-            'support_level': support_level,
-            'resistance_level': resistance_level,
+            # Set once the position has been scaled out to a free ride; the
+            # banked proceeds live in realized_pnl so the final figure stays whole.
+            'scaled_out': False,
+            'realized_pnl': 0.0,
             'entry_momentum': opportunity['momentum'],
             'entry_rsi': opportunity['rsi']
         }
         
         self.open_positions.append(position)
         return position
-    
-    def _get_support_resistance_levels(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
-        """Get support and resistance levels for technical exit signals"""
-        try:
-            historical_data = self.data_fetcher.get_historical_data(symbol, period='3M', interval='1d')
-            if not historical_data or len(historical_data) < 20:
-                return None, None
-            
-            prices = [float(candle['close']) for candle in historical_data]
-            
-            # Simple support/resistance calculation using recent highs and lows
-            recent_highs = []
-            recent_lows = []
-            
-            # Look at last 20 days for levels
-            lookback = min(20, len(prices))
-            for i in range(len(prices) - lookback, len(prices) - 1):
-                if prices[i] > prices[i-1] and prices[i] > prices[i+1]:
-                    recent_highs.append(prices[i])
-                elif prices[i] < prices[i-1] and prices[i] < prices[i+1]:
-                    recent_lows.append(prices[i])
-            
-            # Calculate levels
-            resistance = max(recent_highs) if recent_highs else None
-            support = min(recent_lows) if recent_lows else None
-            
-            return support, resistance
-            
-        except Exception as e:
-            print(f"Error calculating support/resistance for {symbol}: {e}")
-            return None, None
     
     def monitor_positions(self) -> List[Dict]:
         """Monitor open positions and identify exit opportunities"""
@@ -693,33 +670,70 @@ class OptionsBuyStrategy:
         return self._should_exit_position(position, current_price)
 
     def _should_exit_position(self, position: Dict, current_price: float) -> Optional[str]:
-        """Determine if position should be exited"""
-        current_pnl = (current_price - position['entry_price']) * position['position_size']
-        pnl_percent = current_pnl / position['max_risk'] * 100
-        
-        # Profit target hit
-        if current_price >= position['profit_target']:
+        """
+        Determine if position should be exited.
+
+        A position that has been scaled out carries no profit target and no stop:
+        its cost is already recovered, so the remainder is left alone to chase an
+        outsized move and only time decay retires it.
+        """
+        profit_target = position.get('profit_target')
+        if profit_target is not None and current_price >= profit_target:
             return "Profit Target Hit"
-        
-        # Stop loss hit
-        if current_price <= position['stop_loss']:
+
+        stop_loss = position.get('stop_loss')
+        if stop_loss is not None and current_price <= stop_loss:
             return "Stop Loss Hit"
-        
+
         # Time decay exit (close within 5 days of expiry)
         days_held = (datetime.now() - position['entry_date']).days
         if position['dte'] - days_held <= 5:
             return "Time Decay Exit"
-        
-        # High profit exit (50% profit)
-        if pnl_percent >= 50:
-            return "High Profit Exit"
-        
+
         # Technical exit signals
         technical_exit = self._check_technical_exit_signals(position)
         if technical_exit:
             return technical_exit
-        
+
         return None
+
+    def evaluate_scale_out(self, position: Dict, current_price: float) -> int:
+        """
+        Contracts to sell to take the original cash back off the table, or 0.
+
+        Selling qty * entry / current contracts returns the entry cost at the
+        current price, so the higher the price runs before this triggers, the
+        fewer contracts it takes and the bigger the free-riding remainder.
+        Returns 0 when the position is too small to leave a runner behind,
+        since selling everything here would be the fixed-gain cap this replaces.
+        """
+        if position.get('scaled_out'):
+            return 0
+        if current_price < position['entry_price'] * self.criteria.scale_out_multiplier:
+            return 0
+
+        quantity = int(position['position_size'])
+        recoup = position['entry_price'] * quantity * self.criteria.scale_out_recoup_multiple
+        to_sell = math.ceil(recoup / current_price)
+
+        if to_sell >= quantity:
+            return 0
+        return to_sell
+
+    def scale_out_position(self, position: Dict, current_price: float, quantity: int) -> None:
+        """Bank the proceeds of a partial sale and free the remainder to run."""
+        position['realized_pnl'] = position.get('realized_pnl', 0.0) + (
+            (current_price - position['entry_price']) * quantity * OPTION_CONTRACT_MULTIPLIER
+        )
+        position['position_size'] = int(position['position_size']) - quantity
+        position['scaled_out'] = True
+        position['profit_target'] = None
+        position['stop_loss'] = None
+
+        print(
+            f"Scaled out: {position['id']} - sold {quantity} at ${current_price:.2f}, "
+            f"{position['position_size']} left running (banked ${position['realized_pnl']:.2f})"
+        )
     
     def _check_technical_exit_signals(self, position: Dict) -> Optional[str]:
         """Check for technical exit signals"""
@@ -755,18 +769,6 @@ class OptionsBuyStrategy:
                     if recent_rsi > rsi:  # RSI rising from oversold
                         return "RSI Reversal Signal"
             
-            # Support/Resistance breaks
-            resistance_level = position.get('resistance_level')
-            support_level = position.get('support_level')
-            
-            if resistance_level and current_price > resistance_level * 1.02:  # 2% break
-                if position['option_type'] == 'put':
-                    return "Resistance Break - Put Exit"
-            
-            if support_level and current_price < support_level * 0.98:  # 2% break
-                if position['option_type'] == 'call':
-                    return "Support Break - Call Exit"
-            
             # Momentum divergence (simplified)
             momentum = self._calculate_momentum(prices)
             entry_momentum = position.get('entry_momentum', 0.5)
@@ -798,7 +800,7 @@ class OptionsBuyStrategy:
                 (current_price - position['entry_price'])
                 * position['position_size']
                 * OPTION_CONTRACT_MULTIPLIER
-            )
+            ) + position.get('realized_pnl', 0.0)
             
             # Move to closed positions
             self.open_positions.remove(position)

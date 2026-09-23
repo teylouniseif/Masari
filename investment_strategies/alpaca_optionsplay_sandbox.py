@@ -311,6 +311,55 @@ class AlpacaOptionsPlaySandboxExecutor:
 
         return result
 
+    def scale_out_opportunity(
+        self,
+        position: Dict[str, Any],
+        current_price: float,
+        quantity: int,
+        submit_order: bool = True,
+    ) -> AlpacaSandboxOrderResult:
+        """Sell part of a position to recover its cost, leaving the rest to run."""
+        option_symbol = position.get("option_symbol")
+        broker_position = self.data_fetcher.get_position(option_symbol) if option_symbol else None
+        if broker_position is None:
+            return AlpacaSandboxOrderResult(
+                account_id=self.account_id,
+                payload={},
+                error=f"No open Alpaca position found for {option_symbol}.",
+            )
+
+        held = abs(int(float(broker_position.get("qty", 0))))
+        quantity = min(quantity, held - 1)
+        if quantity < 1:
+            return AlpacaSandboxOrderResult(
+                account_id=self.account_id,
+                payload={},
+                error=f"Not enough contracts held in {option_symbol} to scale out.",
+            )
+
+        payload = self._build_order_payload(
+            option_symbol=option_symbol,
+            quantity=quantity,
+            side="sell",
+            order_type="market",
+            position_intent="sell_to_close",
+        )
+        result = AlpacaSandboxOrderResult(
+            account_id=self.account_id,
+            option_symbol=option_symbol,
+            payload=payload,
+        )
+
+        try:
+            if submit_order:
+                result.response = self.data_fetcher.place_order(self.account_id, payload)
+                result.submitted = True
+                self.strategy.scale_out_position(position, current_price, quantity)
+        except Exception as exc:
+            result.error = str(exc)
+
+        return result
+
     # Order still working its way to a fill; not a position yet, not gone either.
     _OPEN_ORDER_STATUSES = {
         "new", "accepted", "pending_new", "accepted_for_bidding",
@@ -346,17 +395,27 @@ class AlpacaOptionsPlaySandboxExecutor:
 
             current_price = float(broker_position.get("current_price", 0.0))
             exit_reason = self.strategy.evaluate_exit(position, current_price)
-            if not exit_reason:
+            if exit_reason:
+                results.append(
+                    self.close_opportunity(
+                        position,
+                        current_price=current_price,
+                        exit_reason=exit_reason,
+                        submit_order=submit_order,
+                    )
+                )
                 continue
 
-            results.append(
-                self.close_opportunity(
-                    position,
-                    current_price=current_price,
-                    exit_reason=exit_reason,
-                    submit_order=submit_order,
+            scale_out_qty = self.strategy.evaluate_scale_out(position, current_price)
+            if scale_out_qty:
+                results.append(
+                    self.scale_out_opportunity(
+                        position,
+                        current_price=current_price,
+                        quantity=scale_out_qty,
+                        submit_order=submit_order,
+                    )
                 )
-            )
 
         return results
 
