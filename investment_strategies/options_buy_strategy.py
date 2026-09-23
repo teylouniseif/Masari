@@ -83,7 +83,12 @@ class OptionsBuyCriteria:
     # Position Sizing
     max_risk_per_trade: float = 2.0  # 2% of account
     profit_target_multiplier: float = 2.0  # 2:1 risk/reward
-    stop_loss_multiplier: float = 0.7  # 30% loss stop
+    # 50% loss stop. Tighter is tempting but backfires: these contracts swing
+    # far enough that a 30% stop gets tripped by noise, and replaying closed
+    # trades against their hourly bars put -30% about $3k behind -50% because
+    # it forced exits on positions that dipped and went on to be the biggest
+    # winners. Both tighter and looser measured worse, including no stop at all.
+    stop_loss_multiplier: float = 0.5
 
     # Scaling out to a free ride.
     # Expectancy here rests on rare outsized winners, so closing the whole
