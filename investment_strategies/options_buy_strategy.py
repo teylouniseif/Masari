@@ -690,6 +690,13 @@ class OptionsBuyStrategy:
         if stop_loss is not None and current_price <= stop_loss:
             return "Stop Loss Hit"
 
+        # Too few contracts to sell part and keep a runner, so bank the whole
+        # gain rather than leave it exposed to a round trip it cannot hedge.
+        if self._at_scale_out_price(position, current_price) and self._cost_recovery_quantity(
+            position, current_price
+        ) >= int(position['position_size']):
+            return "Profit Exit - position too small to scale out"
+
         # Time decay exit (close within 5 days of expiry)
         days_held = (datetime.now() - position['entry_date']).days
         if position['dte'] - days_held <= 5:
@@ -702,6 +709,18 @@ class OptionsBuyStrategy:
 
         return None
 
+    def _at_scale_out_price(self, position: Dict, current_price: float) -> bool:
+        return (
+            not position.get('scaled_out')
+            and current_price >= position['entry_price'] * self.criteria.scale_out_multiplier
+        )
+
+    def _cost_recovery_quantity(self, position: Dict, current_price: float) -> int:
+        """Contracts that must be sold at current_price to return the entry cost."""
+        quantity = int(position['position_size'])
+        recoup = position['entry_price'] * quantity * self.criteria.scale_out_recoup_multiple
+        return math.ceil(recoup / current_price)
+
     def evaluate_scale_out(self, position: Dict, current_price: float) -> int:
         """
         Contracts to sell to take the original cash back off the table, or 0.
@@ -709,19 +728,14 @@ class OptionsBuyStrategy:
         Selling qty * entry / current contracts returns the entry cost at the
         current price, so the higher the price runs before this triggers, the
         fewer contracts it takes and the bigger the free-riding remainder.
-        Returns 0 when the position is too small to leave a runner behind,
-        since selling everything here would be the fixed-gain cap this replaces.
+        Returns 0 when no runner would be left over, which is handled as a full
+        exit by _should_exit_position instead.
         """
-        if position.get('scaled_out'):
-            return 0
-        if current_price < position['entry_price'] * self.criteria.scale_out_multiplier:
+        if not self._at_scale_out_price(position, current_price):
             return 0
 
-        quantity = int(position['position_size'])
-        recoup = position['entry_price'] * quantity * self.criteria.scale_out_recoup_multiple
-        to_sell = math.ceil(recoup / current_price)
-
-        if to_sell >= quantity:
+        to_sell = self._cost_recovery_quantity(position, current_price)
+        if to_sell >= int(position['position_size']):
             return 0
         return to_sell
 
