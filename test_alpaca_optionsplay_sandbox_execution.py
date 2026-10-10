@@ -112,6 +112,15 @@ def main() -> None:
         strategy.save_positions(args.positions_file)
         return
 
+    # Drop contracts too expensive to buy even one of under the risk limit, so
+    # the top slot is not wasted on an order that can only fail sizing.
+    max_premium = executor.max_affordable_premium()
+    opportunities = [opp for opp in opportunities if opp["option"]["ask"] <= max_premium]
+    if not opportunities:
+        print(f"No opportunities at or under ${max_premium:.2f} premium.")
+        strategy.save_positions(args.positions_file)
+        return
+
     print(f"Found {len(opportunities)} opportunities. Executing top {args.max_orders}.")
     for idx, opp in enumerate(opportunities[: args.max_orders], start=1):
         result = executor.execute_opportunity(
@@ -123,6 +132,13 @@ def main() -> None:
         print(
             f"\n[{idx}] {opp['symbol']} {opp['option']['type'].upper()} "
             f"{opp['option']['strike']}"
+        )
+        structure, metrics = opp.get("structure") or {}, opp["metrics"]
+        print(
+            f"  Score: {opp['score']:.0f} | regime: {structure.get('regime')} "
+            f"(level {structure.get('breakout_level')}) | %B: {structure.get('percent_b')} | "
+            f"RSI: {opp['rsi']:.1f} | delta: {metrics.get('delta')} | theta: {metrics.get('theta')} | "
+            f"gamma: {metrics.get('gamma')} | vega: {metrics.get('vega')}"
         )
         if result.error:
             print(f"  Error: {result.error}")

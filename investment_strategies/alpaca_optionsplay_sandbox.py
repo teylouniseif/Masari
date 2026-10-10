@@ -80,6 +80,18 @@ class AlpacaOptionsPlaySandboxExecutor:
 
         return max(min(by_risk, by_buying_power), 0)
 
+    def max_affordable_premium(self) -> float:
+        """
+        Highest per-share premium at which _calculate_quantity still buys one
+        contract. Lets the caller pass over contracts it could never size
+        instead of spending its order slot on one.
+        """
+        account = self.data_fetcher.get_account()
+        equity = float(account.get("equity", 0.0))
+        buying_power = float(account.get("buying_power", 0.0))
+        risk_budget = equity * (self.strategy.criteria.max_risk_per_trade / 100.0)
+        return min(risk_budget, buying_power) / OPTION_CONTRACT_MULTIPLIER
+
     def _collect_option_candidates(self, symbol: str) -> List[Dict[str, Any]]:
         chain = self.data_fetcher.get_option_chain(symbol)
         candidates: List[Dict[str, Any]] = []
