@@ -29,6 +29,7 @@ What actually runs hourly via cron (`scripts/run_alpaca_sandbox_hourly.sh` → `
 | Bid/ask spread | ≤ 20% of ask |
 | Implied volatility | 15%–80% |
 | Delta (magnitude) | 0.30–0.70 |
+| Greeks | Feed must supply delta and theta (checked at scan and again on the contract resolved for the order) |
 
 ⚠️ `min_days_to_expiry = 7` is marked in-code as a **testing value**; the comment says raise to 21 before going live. It must stay above 5, since the time-decay exit fires at `dte_at_entry - days_held <= 5` — anything entered at ≤5 DTE exits almost immediately.
 
@@ -78,21 +79,27 @@ Before submitting, `_has_open_exposure(symbol)` checks both current Alpaca posit
 ## Exit logic (`--monitor` mode)
 
 Runs independently of scanning, evaluated against live bid/ask per open tracked position, in this priority order:
-1. **Profit target** — price ≥ `entry_price × 2.0`
-2. **Stop loss** — price ≤ `entry_price × 0.5`
-3. **Time decay** — `dte_at_entry - days_held ≤ 5`
-4. **High profit** — unrealized P&L ≥ 50% of max risk
-5. **Technical exit** — any of:
-   - RSI reversal (crosses back from >70 for calls / <30 for puts)
-   - Support/resistance break against the position (2% threshold)
-   - Momentum divergence from entry momentum (30% relative move)
+1. **Stop loss** — price ≤ `entry_price × 0.5`
+2. **Time decay** — `dte_at_entry - days_held ≤ 5`
+3. **Technical exit** — any of:
+   - Failed breakout (breakout entries only): price falls back through the breakout level
+   - RSI reversal (range entries only): 14-day RSI two sessions ago was >70 for calls / <30 for puts, and has since turned back
+   - Momentum divergence: 19-day momentum score below 0.7× entry for calls, above 1.3× entry for puts
+4. **Greek exit**, from the live option snapshot — any of:
+   - Delta collapse: |delta| < 0.20
+   - Deep in the money: |delta| > 0.85
+   - Theta burn: daily theta > 5% of the option's current price
+   - IV crush: implied volatility ≤ 75% of its value at entry (positions opened before `entry_iv` was recorded skip this)
+
+   The feed drops Greeks for contracts deep in or far out of the money. Delta then falls back to Black-Scholes, priced with the snapshot IV, else the last IV seen on that position (`last_iv`, refreshed every check), else `entry_iv`. Theta burn and IV crush have no fallback and are skipped.
+
+There is no price-based profit exit: winners run until a technical or Greek signal closes them.
 
 If a tracked position is no longer held at Alpaca at all (expired, exercised, or closed outside this tool), it's reconciled as closed with `final_pnl = None` rather than treated as an exit signal.
 
 ## Risk parameters
 
 - Max risk per trade: 2% of account equity (premium paid = full risk on a long option)
-- Profit target: 2:1 (200% of premium)
 - Stop loss: 50% of premium
 - No portfolio-level risk cap — each hourly scan can open one new position (`--max-orders`) independent of how many are already open, aside from the per-underlying duplicate guard
 

@@ -120,6 +120,8 @@ class AlpacaOptionsPlaySandboxExecutor:
                                 "bid": float(bid),
                                 "ask": float(ask),
                                 "mid": (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0,
+                                "delta": leg.get("delta"),
+                                "theta": leg.get("theta"),
                             }
                         )
         return candidates
@@ -206,6 +208,14 @@ class AlpacaOptionsPlaySandboxExecutor:
                 target_dte=option["dte"],
             )
 
+            # Re-checked here because the contract is re-resolved from a fresh
+            # chain and may not be the one the scan qualified.
+            if resolved.get("delta") is None or resolved.get("theta") is None:
+                raise ValueError(
+                    f"{resolved['option_symbol']} has no Greeks in the feed; not buying a "
+                    "contract the Greek exits can't monitor."
+                )
+
             limit = resolved["ask"] if resolved["ask"] > 0 else metrics.get("mid_price", 0)
             if limit <= 0:
                 raise ValueError("Could not determine a valid limit price for the option order.")
@@ -249,7 +259,6 @@ class AlpacaOptionsPlaySandboxExecutor:
                     # from "position filled and is now gone" when get_position() is empty.
                     position["order_id"] = (result.response or {}).get("id")
                     position["max_risk"] = limit * quantity * 100
-                    position["profit_target"] = limit * self.strategy.criteria.profit_target_multiplier
                     position["stop_loss"] = limit * self.strategy.criteria.stop_loss_multiplier
                     result.impact = result.impact or {}
                     result.impact["tracked_position_id"] = position["id"]
@@ -323,55 +332,6 @@ class AlpacaOptionsPlaySandboxExecutor:
 
         return result
 
-    def scale_out_opportunity(
-        self,
-        position: Dict[str, Any],
-        current_price: float,
-        quantity: int,
-        submit_order: bool = True,
-    ) -> AlpacaSandboxOrderResult:
-        """Sell part of a position to recover its cost, leaving the rest to run."""
-        option_symbol = position.get("option_symbol")
-        broker_position = self.data_fetcher.get_position(option_symbol) if option_symbol else None
-        if broker_position is None:
-            return AlpacaSandboxOrderResult(
-                account_id=self.account_id,
-                payload={},
-                error=f"No open Alpaca position found for {option_symbol}.",
-            )
-
-        held = abs(int(float(broker_position.get("qty", 0))))
-        quantity = min(quantity, held - 1)
-        if quantity < 1:
-            return AlpacaSandboxOrderResult(
-                account_id=self.account_id,
-                payload={},
-                error=f"Not enough contracts held in {option_symbol} to scale out.",
-            )
-
-        payload = self._build_order_payload(
-            option_symbol=option_symbol,
-            quantity=quantity,
-            side="sell",
-            order_type="market",
-            position_intent="sell_to_close",
-        )
-        result = AlpacaSandboxOrderResult(
-            account_id=self.account_id,
-            option_symbol=option_symbol,
-            payload=payload,
-        )
-
-        try:
-            if submit_order:
-                result.response = self.data_fetcher.place_order(self.account_id, payload)
-                result.submitted = True
-                self.strategy.scale_out_position(position, current_price, quantity)
-        except Exception as exc:
-            result.error = str(exc)
-
-        return result
-
     # Order still working its way to a fill; not a position yet, not gone either.
     _OPEN_ORDER_STATUSES = {
         "new", "accepted", "pending_new", "accepted_for_bidding",
@@ -386,7 +346,7 @@ class AlpacaOptionsPlaySandboxExecutor:
     def monitor_and_close(self, submit_order: bool = True) -> List[AlpacaSandboxOrderResult]:
         """
         Check tracked open positions against live Alpaca data. Closes any that hit an
-        exit condition (profit target, stop loss, time decay, technical signal), and
+        exit condition (stop loss, time decay, technical or Greek signal), and
         reconciles positions no longer held at the broker (expired or exercised).
         """
         if self.strategy is None:
@@ -406,7 +366,9 @@ class AlpacaOptionsPlaySandboxExecutor:
                 continue
 
             current_price = float(broker_position.get("current_price", 0.0))
-            exit_reason = self.strategy.evaluate_exit(position, current_price)
+            exit_reason = self.strategy.evaluate_exit(
+                position, current_price, snapshot=self._option_snapshot(option_symbol)
+            )
             if exit_reason:
                 results.append(
                     self.close_opportunity(
@@ -416,20 +378,16 @@ class AlpacaOptionsPlaySandboxExecutor:
                         submit_order=submit_order,
                     )
                 )
-                continue
-
-            scale_out_qty = self.strategy.evaluate_scale_out(position, current_price)
-            if scale_out_qty:
-                results.append(
-                    self.scale_out_opportunity(
-                        position,
-                        current_price=current_price,
-                        quantity=scale_out_qty,
-                        submit_order=submit_order,
-                    )
-                )
 
         return results
+
+    def _option_snapshot(self, option_symbol: str) -> Optional[Dict[str, Any]]:
+        """Live Greeks and IV for one contract, or None so the Greek exits are skipped."""
+        try:
+            return self.data_fetcher.get_option_snapshots([option_symbol]).get(option_symbol)
+        except Exception as exc:
+            print(f"Could not fetch snapshot for {option_symbol}: {exc}")
+            return None
 
     def _reconcile_missing_position(self, position: Dict[str, Any]) -> None:
         """

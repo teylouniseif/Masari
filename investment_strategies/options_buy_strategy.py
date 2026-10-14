@@ -106,7 +106,6 @@ class OptionsBuyCriteria:
     
     # Position Sizing
     max_risk_per_trade: float = 2.0  # 2% of account
-    profit_target_multiplier: float = 2.0  # 2:1 risk/reward
     # 50% loss stop. Tighter is tempting but backfires: these contracts swing
     # far enough that a 30% stop gets tripped by noise, and replaying closed
     # trades against their hourly bars put -30% about $3k behind -50% because
@@ -114,14 +113,15 @@ class OptionsBuyCriteria:
     # winners. Both tighter and looser measured worse, including no stop at all.
     stop_loss_multiplier: float = 0.5
 
-    # Scaling out to a free ride.
-    # Expectancy here rests on rare outsized winners, so closing the whole
-    # position at a fixed gain caps the trades that pay for everything else.
-    # Instead, once price reaches scale_out_multiplier, sell only the contracts
-    # needed to take the original cash back off the table and let the rest run
-    # with no target and no stop - it is playing with money already banked.
-    scale_out_multiplier: float = 1.5  # trigger at +50%
-    scale_out_recoup_multiple: float = 1.0  # 1.0 = recover the entry cost exactly
+    # No price-based profit exit. Expectancy here rests on rare outsized
+    # winners, so a fixed gain target caps the trades that pay for everything
+    # else; winners are closed by the technical and Greek signals instead.
+
+    # Greek exits, read off the live option snapshot.
+    exit_theta_burn: float = 0.05  # daily theta above 5% of the current price
+    exit_min_delta: float = 0.20  # |delta| below this: too far out of the money
+    exit_max_delta: float = 0.85  # |delta| above this: behaves like stock, leverage spent
+    exit_iv_crush: float = 0.25  # IV down 25% or more from entry
 
 class OptionsBuyStrategy:
     """
@@ -319,6 +319,11 @@ class OptionsBuyStrategy:
         if iv < self.criteria.min_implied_volatility or iv > self.criteria.max_implied_volatility:
             return False
 
+        # The Greek exits read delta and theta off the live snapshot, so a
+        # contract the feed can't price would be held with those exits blind.
+        if option_data.get('delta') is None or option_data.get('theta') is None:
+            return False
+
         # Check moneyness via delta: excludes deep-ITM contracts (almost pure
         # intrinsic value, little leverage, often too expensive to size under
         # max_risk_per_trade) and deep-OTM contracts (low probability of profit).
@@ -500,12 +505,10 @@ class OptionsBuyStrategy:
             return {'error': f'Error calculating metrics: {str(e)}'}
     
     def _calculate_call_delta(self, spot: float, strike: float, iv: float, dte: int) -> float:
-        """Simplified call delta calculation"""
+        """Black-Scholes call delta, N(d1), ignoring rates and dividends."""
         try:
-            # Using simplified Black-Scholes delta approximation
             d1 = (np.log(spot / strike) + (iv**2 / 2) * (dte / 365)) / (iv * np.sqrt(dte / 365))
-            delta = 0.5 * (1 + np.tanh(d1))  # Sigmoid approximation of normal CDF
-            return delta
+            return 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
         except:
             return 0.5
     
@@ -755,16 +758,12 @@ class OptionsBuyStrategy:
             'entry_date': datetime.now(),
             'position_size': position_size,
             'max_risk': opportunity['metrics']['mid_price'] * position_size * OPTION_CONTRACT_MULTIPLIER,
-            'profit_target': opportunity['metrics']['mid_price'] * self.criteria.profit_target_multiplier,
             'stop_loss': opportunity['metrics']['mid_price'] * self.criteria.stop_loss_multiplier,
             'status': 'open',
             'current_pnl': 0.0,
             'exit_price': None,
             'exit_date': None,
             'exit_reason': None,
-            # Set once the position has been scaled out to a free ride; the
-            # banked proceeds live in realized_pnl so the final figure stays whole.
-            'scaled_out': False,
             'realized_pnl': 0.0,
             'entry_momentum': opportunity['momentum'],
             'entry_rsi': opportunity['rsi'],
@@ -777,6 +776,7 @@ class OptionsBuyStrategy:
             'entry_theta': opportunity['metrics'].get('theta'),
             'entry_gamma': opportunity['metrics'].get('gamma'),
             'entry_vega': opportunity['metrics'].get('vega'),
+            'entry_iv': opportunity['option'].get('iv'),
         }
         
         self.open_positions.append(position)
@@ -839,32 +839,36 @@ class OptionsBuyStrategy:
             print(f"Error getting current option price: {e}")
             return None
     
-    def evaluate_exit(self, position: Dict, current_price: float) -> Optional[str]:
-        """Public entry point for exit-condition checks against an externally-sourced current price."""
-        return self._should_exit_position(position, current_price)
+    def evaluate_exit(
+        self, position: Dict, current_price: float, snapshot: Optional[Dict] = None
+    ) -> Optional[str]:
+        """
+        Public entry point for exit-condition checks against an externally-sourced
+        current price. snapshot is the live option snapshot (greeks and
+        impliedVolatility); without it delta falls back to Black-Scholes and the
+        other Greek exits are skipped.
+        """
+        current_iv = (snapshot or {}).get('impliedVolatility')
+        if current_iv:
+            # Kept so the delta fallback still has a volatility once the feed
+            # stops quoting one, which tends to happen in the same deep ITM/OTM
+            # territory where it drops the Greeks.
+            position['last_iv'] = current_iv
+        return self._should_exit_position(position, current_price, snapshot)
 
-    def _should_exit_position(self, position: Dict, current_price: float) -> Optional[str]:
+    def _should_exit_position(
+        self, position: Dict, current_price: float, snapshot: Optional[Dict] = None
+    ) -> Optional[str]:
         """
         Determine if position should be exited.
 
-        A position that has been scaled out carries no profit target and no stop:
-        its cost is already recovered, so the remainder is left alone to chase an
-        outsized move and only time decay retires it.
+        There is deliberately no price-based profit exit: winners run until a
+        technical or Greek signal says the move is over. The stop loss and the
+        time decay exit only guard the downside.
         """
-        profit_target = position.get('profit_target')
-        if profit_target is not None and current_price >= profit_target:
-            return "Profit Target Hit"
-
         stop_loss = position.get('stop_loss')
         if stop_loss is not None and current_price <= stop_loss:
             return "Stop Loss Hit"
-
-        # Too few contracts to sell part and keep a runner, so bank the whole
-        # gain rather than leave it exposed to a round trip it cannot hedge.
-        if self._at_scale_out_price(position, current_price) and self._cost_recovery_quantity(
-            position, current_price
-        ) >= int(position['position_size']):
-            return "Profit Exit - position too small to scale out"
 
         # Time decay exit (close within 5 days of expiry)
         days_held = (datetime.now() - position['entry_date']).days
@@ -876,52 +880,59 @@ class OptionsBuyStrategy:
         if technical_exit:
             return technical_exit
 
+        greek_exit = self._check_greek_exit_signals(position, current_price, snapshot or {})
+        if greek_exit:
+            return greek_exit
+
         return None
 
-    def _at_scale_out_price(self, position: Dict, current_price: float) -> bool:
-        return (
-            not position.get('scaled_out')
-            and current_price >= position['entry_price'] * self.criteria.scale_out_multiplier
-        )
+    def _check_greek_exit_signals(
+        self, position: Dict, current_price: float, snapshot: Dict
+    ) -> Optional[str]:
+        """Exit signals read off the option's live Greeks and implied volatility."""
+        greeks = snapshot.get('greeks') or {}
 
-    def _cost_recovery_quantity(self, position: Dict, current_price: float) -> int:
-        """Contracts that must be sold at current_price to return the entry cost."""
-        quantity = int(position['position_size'])
-        recoup = position['entry_price'] * quantity * self.criteria.scale_out_recoup_multiple
-        return math.ceil(recoup / current_price)
+        delta = greeks.get('delta')
+        if delta is None:
+            delta = self._fallback_delta(position, snapshot)
+        if delta is not None:
+            if abs(delta) < self.criteria.exit_min_delta:
+                return "Delta Collapse - far out of the money"
+            if abs(delta) > self.criteria.exit_max_delta:
+                return "Deep In The Money - leverage spent"
 
-    def evaluate_scale_out(self, position: Dict, current_price: float) -> int:
+        # Theta is quoted per share per day and is negative for a long option.
+        theta = greeks.get('theta')
+        if theta is not None and current_price > 0:
+            if -theta / current_price > self.criteria.exit_theta_burn:
+                return "Theta Burn Exit"
+
+        entry_iv = position.get('entry_iv')
+        current_iv = snapshot.get('impliedVolatility')
+        if entry_iv and current_iv:
+            if current_iv <= entry_iv * (1 - self.criteria.exit_iv_crush):
+                return "IV Crush Exit"
+
+        return None
+
+    def _fallback_delta(self, position: Dict, snapshot: Dict) -> Optional[float]:
         """
-        Contracts to sell to take the original cash back off the table, or 0.
-
-        Selling qty * entry / current contracts returns the entry cost at the
-        current price, so the higher the price runs before this triggers, the
-        fewer contracts it takes and the bigger the free-riding remainder.
-        Returns 0 when no runner would be left over, which is handled as a full
-        exit by _should_exit_position instead.
+        Black-Scholes delta for when the feed returns no Greeks, which it does
+        for contracts deep in or far out of the money - exactly where the delta
+        exits matter. None when there is no volatility to price with.
         """
-        if not self._at_scale_out_price(position, current_price):
-            return 0
-
-        to_sell = self._cost_recovery_quantity(position, current_price)
-        if to_sell >= int(position['position_size']):
-            return 0
-        return to_sell
-
-    def scale_out_position(self, position: Dict, current_price: float, quantity: int) -> None:
-        """Bank the proceeds of a partial sale and free the remainder to run."""
-        position['realized_pnl'] = position.get('realized_pnl', 0.0) + (
-            (current_price - position['entry_price']) * quantity * OPTION_CONTRACT_MULTIPLIER
-        )
-        position['position_size'] = int(position['position_size']) - quantity
-        position['scaled_out'] = True
-        position['profit_target'] = None
-        position['stop_loss'] = None
-
-        print(
-            f"Scaled out: {position['id']} - sold {quantity} at ${current_price:.2f}, "
-            f"{position['position_size']} left running (banked ${position['realized_pnl']:.2f})"
-        )
+        iv = snapshot.get('impliedVolatility') or position.get('last_iv') or position.get('entry_iv')
+        if not iv:
+            return None
+        try:
+            spot = float(self.data_fetcher.get_quote(position['symbol'])['lastTradePrice'])
+        except Exception as e:
+            print(f"Error getting underlying price for {position['symbol']}: {e}")
+            return None
+        days_left = position['dte'] - (datetime.now() - position['entry_date']).days
+        if position['option_type'] == 'call':
+            return self._calculate_call_delta(spot, position['strike'], iv, days_left)
+        return self._calculate_put_delta(spot, position['strike'], iv, days_left)
     
     def _check_technical_exit_signals(self, position: Dict) -> Optional[str]:
         """Check for technical exit signals"""
@@ -954,22 +965,18 @@ class OptionsBuyStrategy:
                 if position['option_type'] == 'put' and current_price > breakout_level * (1 + buffer):
                     return "Failed Breakout - back above support"
 
-            # RSI reversal signals
+            # RSI reversal signals: the reading from two sessions back was at an
+            # extreme and today's has turned back from it.
+            prior_rsi = self._calculate_rsi(prices[:-2])
             if on_breakout:
                 pass
             elif position['option_type'] == 'call':
-                # For calls, exit if RSI becomes overbought (>70) and starts declining
-                if rsi > 70 and len(prices) >= 3:
-                    recent_rsi = self._calculate_rsi(prices[-3:])
-                    if recent_rsi < rsi:  # RSI declining from overbought
-                        return "RSI Reversal Signal"
-            
+                if prior_rsi > 70 and rsi < prior_rsi:
+                    return "RSI Reversal Signal"
+
             elif position['option_type'] == 'put':
-                # For puts, exit if RSI becomes oversold (<30) and starts rising
-                if rsi < 30 and len(prices) >= 3:
-                    recent_rsi = self._calculate_rsi(prices[-3:])
-                    if recent_rsi > rsi:  # RSI rising from oversold
-                        return "RSI Reversal Signal"
+                if prior_rsi < 30 and rsi > prior_rsi:
+                    return "RSI Reversal Signal"
             
             # Momentum divergence (simplified)
             momentum = self._calculate_momentum(prices)

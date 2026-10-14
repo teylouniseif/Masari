@@ -25,7 +25,6 @@ def test_options_buying_strategy():
         print(f"  - Min IV: {strategy.criteria.min_implied_volatility:.1%}")
         print(f"  - Max IV: {strategy.criteria.max_implied_volatility:.1%}")
         print(f"  - Max Bid-Ask Spread: {strategy.criteria.max_bid_ask_spread:.1%}")
-        print(f"  - Profit Target: {strategy.criteria.profit_target_multiplier:.1f}x")
         print(f"  - Stop Loss: {strategy.criteria.stop_loss_multiplier:.1f}x")
         
         # Test symbols
@@ -84,7 +83,6 @@ def test_options_buying_strategy():
             print(f"  - Entry Price: ${position['entry_price']:.2f}")
             print(f"  - Position Size: {position['position_size']} contracts")
             print(f"  - Max Risk: ${position['max_risk']:.2f}")
-            print(f"  - Profit Target: ${position['profit_target']:.2f}")
             print(f"  - Stop Loss: ${position['stop_loss']:.2f}")
             
             # Test monitoring
