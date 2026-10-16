@@ -422,6 +422,13 @@ class AlpacaOptionsPlaySandboxExecutor:
             self.strategy.open_positions.remove(position)
             return
 
+        # The fill can land between the position lookup and the order lookup -
+        # queued orders fill in the first seconds after the open - so the order
+        # reads as filled while the position read was empty. Look again before
+        # calling it closed.
+        if self.data_fetcher.get_position(position["option_symbol"]) is not None:
+            return
+
         # The entry order did fill at some point and the position is gone now: a
         # genuine close. Look for the actual closing fill before giving up on price.
         exit_price = self._find_closing_fill_price(

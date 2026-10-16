@@ -776,7 +776,9 @@ class OptionsBuyStrategy:
             'entry_theta': opportunity['metrics'].get('theta'),
             'entry_gamma': opportunity['metrics'].get('gamma'),
             'entry_vega': opportunity['metrics'].get('vega'),
-            'entry_iv': opportunity['option'].get('iv'),
+            # Set from the first live snapshot after the fill, not from the scan:
+            # a limit order can fill hours after the quote the scan priced it on.
+            'entry_iv': None,
         }
         
         self.open_positions.append(position)
@@ -849,6 +851,10 @@ class OptionsBuyStrategy:
         other Greek exits are skipped.
         """
         current_iv = (snapshot or {}).get('impliedVolatility')
+        if current_iv and not position.get('entry_iv'):
+            # Exits are only evaluated on a filled position, so this is the
+            # first IV reading of the contract actually held.
+            position['entry_iv'] = current_iv
         if current_iv:
             # Kept so the delta fallback still has a volatility once the feed
             # stops quoting one, which tends to happen in the same deep ITM/OTM

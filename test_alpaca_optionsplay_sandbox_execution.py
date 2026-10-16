@@ -6,7 +6,9 @@ Usage:
   python3 test_alpaca_optionsplay_sandbox_execution.py --submit    # scan and buy
   python3 test_alpaca_optionsplay_sandbox_execution.py --monitor --submit
       # check previously-bought positions against live prices and sell-to-close any
-      # that hit an exit condition (profit target, stop loss, time decay, technical signal)
+      # that hit an exit condition (stop loss, time decay, technical or Greek signal)
+
+With --submit, both modes do nothing while the market is closed.
 """
 
 import argparse
@@ -64,6 +66,12 @@ def main() -> None:
         f"(status={account.get('status')})."
     )
 
+    # Outside market hours quotes, IV and Greeks are stale, and any order only
+    # queues for the open at a price picked from them. Previews still run.
+    if args.submit and not alpaca_fetcher.is_market_open():
+        print("Market is closed; not trading on stale quotes.")
+        return
+
     strategy = OptionsBuyStrategy(alpaca_fetcher)
     strategy.load_positions(args.positions_file)
     executor = AlpacaOptionsPlaySandboxExecutor(alpaca_fetcher, strategy=strategy)
@@ -118,6 +126,13 @@ def main() -> None:
     opportunities = [opp for opp in opportunities if opp["option"]["ask"] <= max_premium]
     if not opportunities:
         print(f"No opportunities at or under ${max_premium:.2f} premium.")
+        strategy.save_positions(args.positions_file)
+        return
+
+    # A full S&P 500 scan takes about ten minutes, so the 15:00 run can finish
+    # after the close.
+    if args.submit and not alpaca_fetcher.is_market_open():
+        print("Market closed during the scan; not placing orders.")
         strategy.save_positions(args.positions_file)
         return
 

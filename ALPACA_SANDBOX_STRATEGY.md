@@ -2,6 +2,8 @@
 
 What actually runs hourly via cron (`scripts/run_alpaca_sandbox_hourly.sh` → `test_alpaca_optionsplay_sandbox_execution.py --submit`) against the Alpaca paper account. This describes the live code path, not the aspirational design in `OPTIONS_ANALYSIS_README.md` (some numbers below differ from that doc — this one reflects `investment_strategies/options_buy_strategy.py` as currently configured).
 
+Cron fires the scan hourly and the monitor every 15 minutes around the clock, but with `--submit` both exit immediately unless Alpaca's clock says the market is open; the scan checks again before placing orders, since the 15:00 scan can finish after the close. Before this, scans ran overnight and on weekends and queued orders for the open priced off stale quotes (KR bought from a 02:09 scan, CSCO from a Saturday one).
+
 ## Pipeline
 
 1. **Scan** (`OptionsBuyStrategy.find_best_opportunities`, symbols default to the full S&P 500 via `StockScreener.get_sp500_stocks()` scraped from Wikipedia; overridable via `--symbols`). Previously hardcoded to `AAPL MSFT NVDA TSLA` — that was a leftover testing default the cron job never overrode, fixed 2026-08-20. A full 503-symbol scan takes ~10 minutes.
@@ -89,7 +91,7 @@ Runs independently of scanning, evaluated against live bid/ask per open tracked 
    - Delta collapse: |delta| < 0.20
    - Deep in the money: |delta| > 0.85
    - Theta burn: daily theta > 5% of the option's current price
-   - IV crush: implied volatility ≤ 75% of its value at entry (positions opened before `entry_iv` was recorded skip this)
+   - IV crush: implied volatility ≤ 75% of `entry_iv`, the first IV reading after the fill (not the scan's, which can be hours stale by the time a limit order fills)
 
    The feed drops Greeks for contracts deep in or far out of the money. Delta then falls back to Black-Scholes, priced with the snapshot IV, else the last IV seen on that position (`last_iv`, refreshed every check), else `entry_iv`. Theta burn and IV crush have no fallback and are skipped.
 

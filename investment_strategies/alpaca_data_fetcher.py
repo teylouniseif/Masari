@@ -737,6 +737,9 @@ class AlpacaDataFetcher:
             params["after"] = after
         return self._request("GET", "v2/orders", params=params)
 
+    def is_market_open(self) -> bool:
+        return bool(self._request("GET", "v2/clock").get("is_open"))
+
     def get_positions(self) -> List[Dict[str, Any]]:
         return self._request("GET", "v2/positions")
 
