@@ -6,9 +6,12 @@ and what the results have actually been. Read this before changing strategy
 parameters: the last three months of history is mostly a record of parameter changes
 made on too little data, and that is the main trap here.
 
-Companion docs: `ALPACA_SANDBOX_STRATEGY.md` (narrower, code-level spec of the live
-path), `README.md` (repo overview), `OPTIONS_ANALYSIS_README.md` (older aspirational
-design — **does not match the running code**, do not trust its numbers).
+Companion docs:
+
+- **`HISTORY.md`** — the long-form record: every phase of the strategy and why it changed, a 25-entry incident log, the full parameter change log, operational statistics, and the trade-by-trade ledger of all 88 closed trades. Read it before changing a parameter; most of these knobs have been turned before, and several have been turned and reverted.
+- `ALPACA_SANDBOX_STRATEGY.md` — narrower, code-level spec of the live path.
+- `README.md` — repo overview.
+- `OPTIONS_ANALYSIS_README.md` — older aspirational design. **Does not match the running code**; do not trust its numbers.
 
 ---
 
@@ -45,6 +48,7 @@ anything running**. Only the Alpaca options-buying path is live.
 | `alpaca_sandbox_positions.json` | **The state file.** `open_positions` / `closed_positions`, with entry Greeks, regime, breakout level and realized P&L. |
 | `alpaca_credentials.json` | API key/secret (gitignored). Not env vars — the code reads this file. |
 | `logs/alpaca_sandbox_cron.log` | Append-only log of every run since 2026-08-11. ~14 MB. The only record of why a trade was taken. |
+| `HISTORY.md` | Long-form history: phases, incidents, parameter changes, full trade ledger. |
 
 ---
 
@@ -378,7 +382,8 @@ betting on drops in a market that has been grinding up.
 
 ### By rule-set era
 
-Each era is a different exit configuration. Note the sample sizes.
+Each era is a different exit configuration. Note the sample sizes. `HISTORY.md` §1
+covers what changed in each and why, with the measurements behind each decision.
 
 | Era | Dates | n | Net | Win rate |
 |---|---|---:|---:|---:|
@@ -429,6 +434,9 @@ not have.
 
 ## 9. Known bugs and gaps, in the order worth fixing
 
+These are the ones still open. `HISTORY.md` §3 has the full incident log — 25 entries,
+including the 21 already fixed, with dates, evidence and the commit that closed each.
+
 1. **The scan and the monitor overwrite each other's saves.** Both start on the hour. The scan loads the state file at :00 and saves it ~10 minutes later, clobbering anything the monitor wrote in between. The :00 monitor's exit gets resurrected as an open position, then reconciled at :15 — P&L comes out right, nothing is sold twice, but **the exit reason and that run's IV updates are lost**. 10 of 88 closed trades read only "reconciled from fill history", so the exit-rule statistics in §7 are incomplete by construction. Fix: have the scan reload and merge before saving, or put a file lock around both.
 2. **No cooldown after an exit.** A contract can be stopped out and re-bought the same morning. A NFLX put stopped out Tuesday at the open and the scan bought the identical contract back 40 minutes later. INTC was sold on momentum divergence at 09:45, re-bought at 11:11, sold again at 12:30 on the same signal, and re-bought at 13:10 — the scan scores INTC as a buy while the exit rule says its momentum is gone. **Entries and exits are judged by different criteria**, and each round trip pays the spread.
 3. **No portfolio-level risk cap.** `--max-orders 1` limits new positions per scan, not total exposure. Only the per-underlying duplicate guard constrains anything.
@@ -453,7 +461,8 @@ The sample sizes do not support the tuning that has been done. **One trade's P&L
 by about ±$530.** Over the 8–24 trades each rule set has run, that alone moves an era's
 total by ±$1,500 or more. In six weeks the stop went 50% → 30% → 50%, and the profit
 exit went 2× target → scale-out → +30% → nothing. Each of those decisions was made on
-a handful of trades. **That is fitting noise**, and the era table in §7 cannot
+a handful of trades (`HISTORY.md` §4 lists every one with its rationale and whether it
+survived). **That is fitting noise**, and the era table in §7 cannot
 distinguish any of those changes from chance.
 
 If you are going to change this system, the useful order is:
@@ -472,6 +481,7 @@ If you are going to change this system, the useful order is:
 - **Do not place live orders to test something.** Run without `--submit`, or with `--symbols` on a short list.
 - **Never commit `alpaca_credentials.json`** or any log containing a key. It is gitignored; keep it that way. Logs contain the account number and positions, which is fine, but not keys.
 - **State the sample size** whenever you report on a parameter's performance. "The 30% stop did worse" over 15 trades is not a finding.
+- **Check `HISTORY.md` before proposing a change.** The 30% stop, the 2× profit target, the scale-out, the support/resistance exit and the +30% profit exit have all been tried and removed, each for a documented reason. Append new phases and incidents there as they happen rather than growing this file.
 - **When asked for account status**, query Alpaca live and reconcile against the tracking file rather than reading the file alone — they diverge (§8), and the divergences have repeatedly been the actual bug.
 - **Prefer the strategy spec in `ALPACA_SANDBOX_STRATEGY.md` and this file over `OPTIONS_ANALYSIS_README.md`**, which describes a design that was never what ran.
 - The `test_*.py` files at the repo root are a mix of real tests and production entry points. `test_alpaca_optionsplay_sandbox_execution.py` is the live CLI, not a test.
