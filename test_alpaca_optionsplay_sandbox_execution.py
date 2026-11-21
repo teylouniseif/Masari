@@ -6,7 +6,9 @@ Usage:
   python3 test_alpaca_optionsplay_sandbox_execution.py --submit    # scan and buy
   python3 test_alpaca_optionsplay_sandbox_execution.py --monitor --submit
       # check previously-bought positions against live prices and sell-to-close any
-      # that hit an exit condition (profit target, stop loss, time decay, technical signal)
+      # that hit an exit condition (stop loss, time decay, technical or Greek signal)
+
+With --submit, both modes do nothing while the market is closed.
 """
 
 import argparse
@@ -19,6 +21,7 @@ from investment_strategies.options_buy_strategy import (
     DEFAULT_POSITIONS_STORE,
     OptionsBuyStrategy,
 )
+from investment_strategies.stock_screener import StockScreener
 
 
 def main() -> None:
@@ -34,8 +37,8 @@ def main() -> None:
     parser.add_argument(
         "--symbols",
         nargs="+",
-        default=["AAPL", "MSFT", "NVDA", "TSLA"],
-        help="Symbols to scan.",
+        default=None,
+        help="Symbols to scan. Defaults to the full S&P 500 (fetched from Wikipedia).",
     )
     parser.add_argument(
         "--max-orders",
@@ -62,6 +65,12 @@ def main() -> None:
         f"Connected to Alpaca paper account {account.get('account_number')} "
         f"(status={account.get('status')})."
     )
+
+    # Outside market hours quotes, IV and Greeks are stale, and any order only
+    # queues for the open at a price picked from them. Previews still run.
+    if args.submit and not alpaca_fetcher.is_market_open():
+        print("Market is closed; not trading on stale quotes.")
+        return
 
     strategy = OptionsBuyStrategy(alpaca_fetcher)
     strategy.load_positions(args.positions_file)
@@ -95,9 +104,35 @@ def main() -> None:
         strategy.save_positions(args.positions_file)
         return
 
-    opportunities = strategy.find_best_opportunities(args.symbols)
+    symbols = args.symbols
+    if symbols is None:
+        sp500 = StockScreener(alpaca_fetcher).get_sp500_stocks()
+        if sp500.empty:
+            print("Could not fetch S&P 500 list; falling back to a small default set.")
+            symbols = ["AAPL", "MSFT", "NVDA", "TSLA"]
+        else:
+            symbols = sp500["Symbol"].tolist()
+    print(f"Scanning {len(symbols)} symbol(s).")
+
+    opportunities = strategy.find_best_opportunities(symbols)
     if not opportunities:
         print("No opportunities found.")
+        strategy.save_positions(args.positions_file)
+        return
+
+    # Drop contracts too expensive to buy even one of under the risk limit, so
+    # the top slot is not wasted on an order that can only fail sizing.
+    max_premium = executor.max_affordable_premium()
+    opportunities = [opp for opp in opportunities if opp["option"]["ask"] <= max_premium]
+    if not opportunities:
+        print(f"No opportunities at or under ${max_premium:.2f} premium.")
+        strategy.save_positions(args.positions_file)
+        return
+
+    # A full S&P 500 scan takes about ten minutes, so the 15:00 run can finish
+    # after the close.
+    if args.submit and not alpaca_fetcher.is_market_open():
+        print("Market closed during the scan; not placing orders.")
         strategy.save_positions(args.positions_file)
         return
 
@@ -112,6 +147,13 @@ def main() -> None:
         print(
             f"\n[{idx}] {opp['symbol']} {opp['option']['type'].upper()} "
             f"{opp['option']['strike']}"
+        )
+        structure, metrics = opp.get("structure") or {}, opp["metrics"]
+        print(
+            f"  Score: {opp['score']:.0f} | regime: {structure.get('regime')} "
+            f"(level {structure.get('breakout_level')}) | %B: {structure.get('percent_b')} | "
+            f"RSI: {opp['rsi']:.1f} | delta: {metrics.get('delta')} | theta: {metrics.get('theta')} | "
+            f"gamma: {metrics.get('gamma')} | vega: {metrics.get('vega')}"
         )
         if result.error:
             print(f"  Error: {result.error}")

@@ -4,6 +4,7 @@ This strategy identifies optimal entry points for buying options and determines 
 """
 
 import json
+import math
 import os
 import pandas as pd
 import numpy as np
@@ -55,18 +56,72 @@ class OptionsBuyCriteria:
     # Volatility Criteria
     min_implied_volatility: float = 0.15  # 15% minimum
     max_implied_volatility: float = 0.80  # 80% maximum
-    volatility_percentile_min: float = 20  # IV in bottom 20% (cheap options)
+    # Reject a symbol when its option premium is expensive relative to how much
+    # that stock has actually been moving. Ranked against the name's own trailing
+    # realized volatility, so it adapts per ticker rather than using a flat IV cut.
+    # Long options lose value when implied volatility falls regardless of
+    # direction, so buying into rich premium is a structural drag.
+    # Calibrated against a 30-name sample where the rank distribution ran
+    # median 56 / p75 68: this keeps ~70% of candidates and excludes the tail
+    # (83+) where premium is genuinely rich for the name.
+    max_iv_percentile: float = 65.0
+
+    # Moneyness / Delta Criteria
+    # Constrains contracts to a directional-leverage sweet spot. Without this,
+    # nothing stops the scanner from picking deep-ITM contracts that are almost
+    # pure intrinsic value (little leverage, and often too expensive to size
+    # under max_risk_per_trade at all).
+    min_delta: float = 0.30
+    max_delta: float = 0.70
     
     # Technical Criteria
     momentum_period: int = 20
     rsi_period: int = 14
     min_rsi: float = 30
     max_rsi: float = 70
+
+    # Breakout handling.
+    # The RSI signal is mean reversion: it buys puts on overbought names. A stock
+    # clearing resistance is overbought by construction, so without this the
+    # scanner fades every breakout (three NVDA puts in a week at RSI 66-84).
+    # Resistance/support are the highest high / lowest low of the breakout_lookback
+    # bars before a given day. A break stays in force for breakout_memory bars as
+    # long as price holds beyond the broken level, since the day after a breakout
+    # the stock is usually consolidating under its new high, not printing another.
+    breakout_lookback: int = 20
+    breakout_memory: int = 5
+    # A breakout trade is abandoned once the underlying falls back through the
+    # level it broke by more than this fraction (a plain retest is tolerated).
+    breakout_failure_buffer: float = 0.01
+
+    # Bollinger Bands on daily closes.
+    bollinger_period: int = 20
+    bollinger_std: float = 2.0
+
+    # Theta burn: daily decay as a fraction of the premium paid. An at-the-money
+    # option loses roughly 1/(2*DTE) of its value per day, so 5% is about 10 DTE
+    # and 2.5% about 20 DTE.
+    max_theta_burn: float = 0.05
+    low_theta_burn: float = 0.025
     
     # Position Sizing
     max_risk_per_trade: float = 2.0  # 2% of account
-    profit_target_multiplier: float = 2.0  # 2:1 risk/reward
-    stop_loss_multiplier: float = 0.5  # 50% loss stop
+    # 50% loss stop. Tighter is tempting but backfires: these contracts swing
+    # far enough that a 30% stop gets tripped by noise, and replaying closed
+    # trades against their hourly bars put -30% about $3k behind -50% because
+    # it forced exits on positions that dipped and went on to be the biggest
+    # winners. Both tighter and looser measured worse, including no stop at all.
+    stop_loss_multiplier: float = 0.5
+
+    # No price-based profit exit. Expectancy here rests on rare outsized
+    # winners, so a fixed gain target caps the trades that pay for everything
+    # else; winners are closed by the technical and Greek signals instead.
+
+    # Greek exits, read off the live option snapshot.
+    exit_theta_burn: float = 0.05  # daily theta above 5% of the current price
+    exit_min_delta: float = 0.20  # |delta| below this: too far out of the money
+    exit_max_delta: float = 0.85  # |delta| above this: behaves like stock, leverage spent
+    exit_iv_crush: float = 0.25  # IV down 25% or more from entry
 
 class OptionsBuyStrategy:
     """
@@ -76,7 +131,8 @@ class OptionsBuyStrategy:
     def __init__(self, data_fetcher: OptionsDataFetcher):
         self.data_fetcher = data_fetcher
         self.criteria = OptionsBuyCriteria()
-        
+        self._realized_vol_cache: Dict[str, List[float]] = {}
+
         # Track open positions
         self.open_positions = []
         self.closed_positions = []
@@ -113,7 +169,7 @@ class OptionsBuyStrategy:
         normalized_momentum = 1 / (1 + np.exp(-momentum * 10))
         return normalized_momentum
     
-    def _get_option_chain_analysis(self, symbol: str) -> Dict:
+    def _get_option_chain_analysis(self, symbol: str, current_price: float) -> Dict:
         """Get and analyze option chain for a symbol"""
         try:
             option_chain = self.data_fetcher.get_option_chain(symbol)
@@ -137,7 +193,9 @@ class OptionsBuyStrategy:
                             
                             # Analyze calls
                             call_data = self._resolve_option_leg_data(strike_data, "call", option_quote_lookup)
-                            if call_data and self._is_option_suitable(call_data, strike_price):
+                            if call_data and self._is_option_suitable(
+                                call_data, strike_price, "call", current_price, dte
+                            ):
                                 suitable_options.append({
                                     'type': 'call',
                                     'strike': strike_price,
@@ -147,11 +205,14 @@ class OptionsBuyStrategy:
                                     'volume': call_data.get('volume', 0),
                                     'open_interest': call_data.get('openInterest', call_data.get('open_interest', 0)),
                                     'iv': call_data.get('volatility', call_data.get('impliedVolatility', 0)),
+                                    **self._leg_greeks(call_data),
                                 })
 
                             # Analyze puts
                             put_data = self._resolve_option_leg_data(strike_data, "put", option_quote_lookup)
-                            if put_data and self._is_option_suitable(put_data, strike_price):
+                            if put_data and self._is_option_suitable(
+                                put_data, strike_price, "put", current_price, dte
+                            ):
                                 suitable_options.append({
                                     'type': 'put',
                                     'strike': strike_price,
@@ -161,12 +222,18 @@ class OptionsBuyStrategy:
                                     'volume': put_data.get('volume', 0),
                                     'open_interest': put_data.get('openInterest', put_data.get('open_interest', 0)),
                                     'iv': put_data.get('volatility', put_data.get('impliedVolatility', 0)),
+                                    **self._leg_greeks(put_data),
                                 })
             
             return {'options': suitable_options}
             
         except Exception as e:
             return {'error': f'Error analyzing option chain: {str(e)}'}
+
+    @staticmethod
+    def _leg_greeks(leg: Dict) -> Dict[str, Optional[float]]:
+        """Broker-supplied Greeks for a leg; None where the feed has none."""
+        return {greek: leg.get(greek) for greek in ('delta', 'gamma', 'theta', 'vega')}
 
     def _build_option_quote_lookup(self, option_chain: Dict) -> Dict[int, Dict]:
         """
@@ -218,35 +285,173 @@ class OptionsBuyStrategy:
 
         return quote_lookup.get(int(symbol_id), {})
     
-    def _is_option_suitable(self, option_data: Dict, strike_price: float) -> bool:
+    def _is_option_suitable(
+        self,
+        option_data: Dict,
+        strike_price: float,
+        option_type: str,
+        current_price: float,
+        dte: int,
+    ) -> bool:
         """Check if an individual option meets our criteria"""
         bid = option_data.get('bid', 0)
         ask = option_data.get('ask', 0)
         volume = option_data.get('volume', 0)
         open_interest = option_data.get('openInterest', 0)
-        iv = option_data.get('volatility', 0)
+        iv = option_data.get('impliedVolatility', option_data.get('volatility', 0))
 
         if bid <= 0 or ask <= 0:
             return False
-        
+
         # Check bid-ask spread
         spread = (ask - bid) / ask
         if spread > self.criteria.max_bid_ask_spread:
             return False
-        
+
         # Check volume and open interest
         if volume < self.criteria.min_option_volume:
             return False
-        
+
         if open_interest < self.criteria.min_open_interest:
             return False
-        
+
         # Check implied volatility
         if iv < self.criteria.min_implied_volatility or iv > self.criteria.max_implied_volatility:
             return False
-        
+
+        # The Greek exits read delta and theta off the live snapshot, so a
+        # contract the feed can't price would be held with those exits blind.
+        if option_data.get('delta') is None or option_data.get('theta') is None:
+            return False
+
+        # Check moneyness via delta: excludes deep-ITM contracts (almost pure
+        # intrinsic value, little leverage, often too expensive to size under
+        # max_risk_per_trade) and deep-OTM contracts (low probability of profit).
+        delta = abs(self._option_delta(option_data, option_type, current_price, strike_price, iv, dte))
+        if delta < self.criteria.min_delta or delta > self.criteria.max_delta:
+            return False
+
         return True
     
+    def _option_delta(
+        self, leg: Dict, option_type: str, spot: float, strike: float, iv: float, dte: int
+    ) -> float:
+        """
+        Signed delta. Uses the broker's figure, which comes from a real pricing
+        model; the closed-form approximation below is only a fallback for the
+        legs the feed returns without Greeks.
+        """
+        delta = leg.get('delta')
+        if delta is not None:
+            return float(delta)
+        if option_type == 'call':
+            return self._calculate_call_delta(spot, strike, iv, dte)
+        return self._calculate_put_delta(spot, strike, iv, dte)
+
+    def _price_structure(self, bars: List[Dict], current_price: float) -> Dict[str, Any]:
+        """
+        Where price sits relative to its recent range: whether it has broken
+        resistance or support, and its position inside the Bollinger Bands.
+
+        regime is 'breakout_up', 'breakout_down' or 'range'. percent_b is 0 at
+        the lower band and 1 at the upper, and runs outside 0-1 beyond them.
+        """
+        structure: Dict[str, Any] = {
+            'regime': 'range', 'breakout_level': None,
+            'bollinger_upper': None, 'bollinger_lower': None, 'percent_b': None,
+        }
+        closes = [float(bar['close']) for bar in bars]
+        if not closes:
+            return structure
+        # The last bar is the session in progress, so the live price stands in
+        # for its close.
+        closes[-1] = current_price
+
+        period = self.criteria.bollinger_period
+        if len(closes) >= period:
+            window = closes[-period:]
+            middle = float(np.mean(window))
+            width = float(np.std(window)) * self.criteria.bollinger_std
+            structure['bollinger_upper'] = middle + width
+            structure['bollinger_lower'] = middle - width
+            if width > 0:
+                structure['percent_b'] = (current_price - (middle - width)) / (2 * width)
+
+        lookback, memory = self.criteria.breakout_lookback, self.criteria.breakout_memory
+        if len(bars) < lookback + memory:
+            return structure
+        highs = [float(bar['high']) for bar in bars]
+        lows = [float(bar['low']) for bar in bars]
+
+        # Oldest day first: the first break in a direction fixes the level (that
+        # is the resistance that actually gave way), and a later break the other
+        # way replaces it.
+        regime, level = 'range', None
+        for i in range(len(bars) - memory, len(bars)):
+            if closes[i] > max(highs[i - lookback:i]):
+                if regime != 'breakout_up':
+                    regime, level = 'breakout_up', max(highs[i - lookback:i])
+            elif closes[i] < min(lows[i - lookback:i]):
+                if regime != 'breakout_down':
+                    regime, level = 'breakout_down', min(lows[i - lookback:i])
+
+        still_beyond = (
+            (regime == 'breakout_up' and current_price > level)
+            or (regime == 'breakout_down' and current_price < level)
+        )
+        if still_beyond:
+            structure['regime'], structure['breakout_level'] = regime, level
+        return structure
+
+    def _realized_volatility_distribution(self, symbol: str, window: int = 20) -> List[float]:
+        """
+        Rolling annualized realized volatility over the past year, used as the
+        reference distribution for ranking today's implied volatility.
+
+        True IV percentile would rank IV against a year of past IV readings, but
+        that history is not available from the data feed, so the stock's own
+        realized volatility stands in for it. The two are correlated but not
+        equal: implied normally sits a few points above realized, which biases
+        the resulting rank upward. max_iv_percentile is calibrated for that bias.
+        """
+        if symbol in self._realized_vol_cache:
+            return self._realized_vol_cache[symbol]
+
+        bars = self.data_fetcher.get_historical_data(symbol, period='1y', interval='1d') or []
+        closes = [bar['close'] for bar in bars if bar.get('close')]
+
+        distribution: List[float] = []
+        if len(closes) > window + 1:
+            returns = np.diff(np.log(closes))
+            distribution = [
+                float(np.std(returns[i - window:i]) * np.sqrt(252))
+                for i in range(window, len(returns) + 1)
+            ]
+
+        self._realized_vol_cache[symbol] = distribution
+        return distribution
+
+    def _current_implied_volatility(
+        self, options: List[Dict], current_price: float, sample_size: int = 6
+    ) -> Optional[float]:
+        """
+        Median IV of the contracts nearest the money. Median rather than the
+        single closest strike so one stale or crossed quote cannot swing the
+        reading for the whole symbol.
+        """
+        nearest = sorted(options, key=lambda o: abs(o['strike'] - current_price))[:sample_size]
+        ivs = [o['iv'] for o in nearest if o.get('iv')]
+        return float(np.median(ivs)) if ivs else None
+
+    def _implied_volatility_percentile(
+        self, implied_volatility: float, distribution: List[float]
+    ) -> Optional[float]:
+        """Where implied volatility ranks within the reference distribution, 0-100."""
+        if not distribution:
+            return None
+        below = sum(1 for value in distribution if value < implied_volatility)
+        return 100.0 * below / len(distribution)
+
     def _calculate_option_metrics(self, symbol: str, option: Dict, current_price: float) -> Dict:
         """Calculate key metrics for an option"""
         try:
@@ -256,20 +461,26 @@ class OptionsBuyStrategy:
             dte = option['dte']
             mid_price = (option['bid'] + option['ask']) / 2
             
-            # Simplified delta calculation
+            delta = self._option_delta(option, option['type'], current_price, strike, iv, dte)
             if option['type'] == 'call':
-                delta = self._calculate_call_delta(current_price, strike, iv, dte)
                 intrinsic_value = max(0, current_price - strike)
             else:  # put
-                delta = self._calculate_put_delta(current_price, strike, iv, dte)
                 intrinsic_value = max(0, strike - current_price)
             
             time_value = mid_price - intrinsic_value
             
-            # Calculate probability of profit (simplified)
-            prob_profit = self._calculate_probability_of_profit(
-                current_price, strike, iv, dte, option['type']
-            )
+            # |delta| is the standard proxy for the chance of finishing in the
+            # money. The home-made estimate is kept only for legs without Greeks:
+            # it reads ~0.8 for an at-the-money contract, so it flatters everything.
+            if option.get('delta') is not None:
+                prob_profit = abs(delta)
+            else:
+                prob_profit = self._calculate_probability_of_profit(
+                    current_price, strike, iv, dte, option['type']
+                )
+
+            theta = option.get('theta')
+            theta_burn = abs(theta) / mid_price if theta is not None and mid_price > 0 else None
             
             # Calculate risk/reward
             max_risk = mid_price
@@ -283,19 +494,21 @@ class OptionsBuyStrategy:
                 'time_value': time_value,
                 'prob_profit': prob_profit,
                 'risk_reward': risk_reward,
-                'time_decay_daily': time_value / dte if dte > 0 else 0
+                'gamma': option.get('gamma'),
+                'theta': theta,
+                'vega': option.get('vega'),
+                'theta_burn': theta_burn,
+                'time_decay_daily': abs(theta) if theta is not None else (time_value / dte if dte > 0 else 0)
             }
             
         except Exception as e:
             return {'error': f'Error calculating metrics: {str(e)}'}
     
     def _calculate_call_delta(self, spot: float, strike: float, iv: float, dte: int) -> float:
-        """Simplified call delta calculation"""
+        """Black-Scholes call delta, N(d1), ignoring rates and dividends."""
         try:
-            # Using simplified Black-Scholes delta approximation
             d1 = (np.log(spot / strike) + (iv**2 / 2) * (dte / 365)) / (iv * np.sqrt(dte / 365))
-            delta = 0.5 * (1 + np.tanh(d1))  # Sigmoid approximation of normal CDF
-            return delta
+            return 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
         except:
             return 0.5
     
@@ -350,16 +563,47 @@ class OptionsBuyStrategy:
             prices = [bar['close'] for bar in historical_data]
             rsi = self._calculate_rsi(prices, self.criteria.rsi_period)
             momentum = self._calculate_momentum(prices, self.criteria.momentum_period)
+            structure = self._price_structure(historical_data, current_price)
             
             # Get option chain analysis
-            option_analysis = self._get_option_chain_analysis(symbol)
+            option_analysis = self._get_option_chain_analysis(symbol, current_price)
             if 'error' in option_analysis:
                 return {'symbol': symbol, 'error': option_analysis['error']}
             
             suitable_options = option_analysis['options']
             if not suitable_options:
                 return {'symbol': symbol, 'error': 'No suitable options found'}
-            
+
+            implied_volatility = self._current_implied_volatility(suitable_options, current_price)
+            iv_percentile = None
+            if implied_volatility is not None:
+                iv_percentile = self._implied_volatility_percentile(
+                    implied_volatility, self._realized_volatility_distribution(symbol)
+                )
+            if iv_percentile is not None and iv_percentile > self.criteria.max_iv_percentile:
+                return {
+                    'symbol': symbol,
+                    'error': (
+                        f'Premium too rich: IV {implied_volatility:.1%} ranks at the '
+                        f'{iv_percentile:.0f}th percentile of this name\'s realized '
+                        f'volatility (max {self.criteria.max_iv_percentile:.0f})'
+                    ),
+                }
+
+            # On a breakout only trade with it: calls above broken resistance,
+            # puts below broken support. The opposing side is not scored at all.
+            with_breakout = {'breakout_up': 'call', 'breakout_down': 'put'}.get(structure['regime'])
+            if with_breakout:
+                suitable_options = [o for o in suitable_options if o['type'] == with_breakout]
+                if not suitable_options:
+                    return {
+                        'symbol': symbol,
+                        'error': (
+                            f"{structure['regime']} through {structure['breakout_level']:.2f} "
+                            f"but no suitable {with_breakout}s"
+                        ),
+                    }
+
             # Score the opportunities
             best_opportunities = []
             for option in suitable_options:
@@ -368,7 +612,7 @@ class OptionsBuyStrategy:
                     continue
                 
                 # Calculate opportunity score
-                score = 0#self._calculate_opportunity_score(option, metrics, rsi, momentum)
+                score = self._calculate_opportunity_score(option, metrics, rsi, momentum, structure)
                 
                 best_opportunities.append({
                     'option': option,
@@ -384,6 +628,9 @@ class OptionsBuyStrategy:
                 'current_price': current_price,
                 'rsi': rsi,
                 'momentum': momentum,
+                'implied_volatility': implied_volatility,
+                'iv_percentile': iv_percentile,
+                'structure': structure,
                 'opportunities': best_opportunities[:5],  # Top 5
                 'total_options': len(suitable_options)
             }
@@ -391,12 +638,33 @@ class OptionsBuyStrategy:
         except Exception as e:
             return {'symbol': symbol, 'error': f'Analysis error: {str(e)}'}
     
-    def _calculate_opportunity_score(self, option: Dict, metrics: Dict, rsi: float, momentum: float) -> float:
+    def _calculate_opportunity_score(
+        self,
+        option: Dict,
+        metrics: Dict,
+        rsi: float,
+        momentum: float,
+        structure: Optional[Dict[str, Any]] = None,
+    ) -> float:
         """Calculate a score for the option opportunity"""
         score = 0.0
-        
+        structure = structure or {}
+        regime = structure.get('regime', 'range')
+        percent_b = structure.get('percent_b')
+        is_call = option['type'] == 'call'
+
+        if regime != 'range':
+            # Trading with a breakout (the opposing side was already dropped).
+            # It scores like a full RSI signal, and RSI itself is ignored: an
+            # overbought reading is what a breakout looks like, not a reason to
+            # mark the call down.
+            score += 30
+            # Price outside the band on the breakout side confirms the range is
+            # expanding rather than just being poked.
+            if percent_b is not None and (percent_b > 1 if is_call else percent_b < 0):
+                score += 15
         # RSI scoring (prefer oversold for calls, overbought for puts)
-        if option['type'] == 'call':
+        elif option['type'] == 'call':
             if rsi < 40:  # Oversold - good for calls
                 score += 30
             elif rsi > 60:  # Overbought - bad for calls
@@ -406,6 +674,20 @@ class OptionsBuyStrategy:
                 score += 30
             elif rsi < 40:  # Oversold - bad for puts
                 score -= 20
+
+        # Inside a range a call near the lower band backs up the mean-reversion
+        # read. Calls only: the mirror case, a put near the upper band, lost on
+        # all eight entries since late September, so it earns nothing.
+        if regime == 'range' and is_call and percent_b is not None and percent_b < 0.2:
+            score += 15
+
+        # Theta: how much of the premium is lost per day just by holding.
+        theta_burn = metrics.get('theta_burn')
+        if theta_burn is not None:
+            if theta_burn > self.criteria.max_theta_burn:
+                score -= 15
+            elif theta_burn < self.criteria.low_theta_burn:
+                score += 10
         
         # Momentum scoring
         if option['type'] == 'call':
@@ -437,9 +719,7 @@ class OptionsBuyStrategy:
             score += 10
         if option['open_interest'] > 1000:
             score += 10
-            
-        score = 80
-        
+
         return max(0, score)  # Don't allow negative scores
     
     def find_best_opportunities(self, symbols: List[str]) -> List[Dict]:
@@ -456,6 +736,7 @@ class OptionsBuyStrategy:
                         'current_price': analysis['current_price'],
                         'rsi': analysis['rsi'],
                         'momentum': analysis['momentum'],
+                        'structure': analysis['structure'],
                         'option': opp['option'],
                         'metrics': opp['metrics'],
                         'score': opp['score']
@@ -467,9 +748,6 @@ class OptionsBuyStrategy:
     
     def create_position(self, opportunity: Dict, position_size: float = 1.0) -> Dict:
         """Create a new options position"""
-        # Get technical levels for exit signals
-        support_level, resistance_level = self._get_support_resistance_levels(opportunity['symbol'])
-        
         position = {
             'id': f"{opportunity['symbol']}_{opportunity['option']['type']}_{opportunity['option']['strike']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             'symbol': opportunity['symbol'],
@@ -480,53 +758,31 @@ class OptionsBuyStrategy:
             'entry_date': datetime.now(),
             'position_size': position_size,
             'max_risk': opportunity['metrics']['mid_price'] * position_size * OPTION_CONTRACT_MULTIPLIER,
-            'profit_target': opportunity['metrics']['mid_price'] * self.criteria.profit_target_multiplier,
             'stop_loss': opportunity['metrics']['mid_price'] * self.criteria.stop_loss_multiplier,
             'status': 'open',
             'current_pnl': 0.0,
             'exit_price': None,
             'exit_date': None,
             'exit_reason': None,
-            # Technical levels for exit signals
-            'support_level': support_level,
-            'resistance_level': resistance_level,
+            'realized_pnl': 0.0,
             'entry_momentum': opportunity['momentum'],
-            'entry_rsi': opportunity['rsi']
+            'entry_rsi': opportunity['rsi'],
+            # Why this contract was picked, kept so a trade can be explained later.
+            'entry_score': opportunity.get('score'),
+            'entry_regime': (opportunity.get('structure') or {}).get('regime', 'range'),
+            'breakout_level': (opportunity.get('structure') or {}).get('breakout_level'),
+            'entry_percent_b': (opportunity.get('structure') or {}).get('percent_b'),
+            'entry_delta': opportunity['metrics'].get('delta'),
+            'entry_theta': opportunity['metrics'].get('theta'),
+            'entry_gamma': opportunity['metrics'].get('gamma'),
+            'entry_vega': opportunity['metrics'].get('vega'),
+            # Set from the first live snapshot after the fill, not from the scan:
+            # a limit order can fill hours after the quote the scan priced it on.
+            'entry_iv': None,
         }
         
         self.open_positions.append(position)
         return position
-    
-    def _get_support_resistance_levels(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
-        """Get support and resistance levels for technical exit signals"""
-        try:
-            historical_data = self.data_fetcher.get_historical_data(symbol, period='3M', interval='1d')
-            if not historical_data or len(historical_data) < 20:
-                return None, None
-            
-            prices = [float(candle['close']) for candle in historical_data]
-            
-            # Simple support/resistance calculation using recent highs and lows
-            recent_highs = []
-            recent_lows = []
-            
-            # Look at last 20 days for levels
-            lookback = min(20, len(prices))
-            for i in range(len(prices) - lookback, len(prices) - 1):
-                if prices[i] > prices[i-1] and prices[i] > prices[i+1]:
-                    recent_highs.append(prices[i])
-                elif prices[i] < prices[i-1] and prices[i] < prices[i+1]:
-                    recent_lows.append(prices[i])
-            
-            # Calculate levels
-            resistance = max(recent_highs) if recent_highs else None
-            support = min(recent_lows) if recent_lows else None
-            
-            return support, resistance
-            
-        except Exception as e:
-            print(f"Error calculating support/resistance for {symbol}: {e}")
-            return None, None
     
     def monitor_positions(self) -> List[Dict]:
         """Monitor open positions and identify exit opportunities"""
@@ -585,38 +841,104 @@ class OptionsBuyStrategy:
             print(f"Error getting current option price: {e}")
             return None
     
-    def evaluate_exit(self, position: Dict, current_price: float) -> Optional[str]:
-        """Public entry point for exit-condition checks against an externally-sourced current price."""
-        return self._should_exit_position(position, current_price)
+    def evaluate_exit(
+        self, position: Dict, current_price: float, snapshot: Optional[Dict] = None
+    ) -> Optional[str]:
+        """
+        Public entry point for exit-condition checks against an externally-sourced
+        current price. snapshot is the live option snapshot (greeks and
+        impliedVolatility); without it delta falls back to Black-Scholes and the
+        other Greek exits are skipped.
+        """
+        current_iv = (snapshot or {}).get('impliedVolatility')
+        if current_iv and not position.get('entry_iv'):
+            # Exits are only evaluated on a filled position, so this is the
+            # first IV reading of the contract actually held.
+            position['entry_iv'] = current_iv
+        if current_iv:
+            # Kept so the delta fallback still has a volatility once the feed
+            # stops quoting one, which tends to happen in the same deep ITM/OTM
+            # territory where it drops the Greeks.
+            position['last_iv'] = current_iv
+        return self._should_exit_position(position, current_price, snapshot)
 
-    def _should_exit_position(self, position: Dict, current_price: float) -> Optional[str]:
-        """Determine if position should be exited"""
-        current_pnl = (current_price - position['entry_price']) * position['position_size']
-        pnl_percent = current_pnl / position['max_risk'] * 100
-        
-        # Profit target hit
-        if current_price >= position['profit_target']:
-            return "Profit Target Hit"
-        
-        # Stop loss hit
-        if current_price <= position['stop_loss']:
+    def _should_exit_position(
+        self, position: Dict, current_price: float, snapshot: Optional[Dict] = None
+    ) -> Optional[str]:
+        """
+        Determine if position should be exited.
+
+        There is deliberately no price-based profit exit: winners run until a
+        technical or Greek signal says the move is over. The stop loss and the
+        time decay exit only guard the downside.
+        """
+        stop_loss = position.get('stop_loss')
+        if stop_loss is not None and current_price <= stop_loss:
             return "Stop Loss Hit"
-        
+
         # Time decay exit (close within 5 days of expiry)
         days_held = (datetime.now() - position['entry_date']).days
         if position['dte'] - days_held <= 5:
             return "Time Decay Exit"
-        
-        # High profit exit (50% profit)
-        if pnl_percent >= 50:
-            return "High Profit Exit"
-        
+
         # Technical exit signals
         technical_exit = self._check_technical_exit_signals(position)
         if technical_exit:
             return technical_exit
-        
+
+        greek_exit = self._check_greek_exit_signals(position, current_price, snapshot or {})
+        if greek_exit:
+            return greek_exit
+
         return None
+
+    def _check_greek_exit_signals(
+        self, position: Dict, current_price: float, snapshot: Dict
+    ) -> Optional[str]:
+        """Exit signals read off the option's live Greeks and implied volatility."""
+        greeks = snapshot.get('greeks') or {}
+
+        delta = greeks.get('delta')
+        if delta is None:
+            delta = self._fallback_delta(position, snapshot)
+        if delta is not None:
+            if abs(delta) < self.criteria.exit_min_delta:
+                return "Delta Collapse - far out of the money"
+            if abs(delta) > self.criteria.exit_max_delta:
+                return "Deep In The Money - leverage spent"
+
+        # Theta is quoted per share per day and is negative for a long option.
+        theta = greeks.get('theta')
+        if theta is not None and current_price > 0:
+            if -theta / current_price > self.criteria.exit_theta_burn:
+                return "Theta Burn Exit"
+
+        entry_iv = position.get('entry_iv')
+        current_iv = snapshot.get('impliedVolatility')
+        if entry_iv and current_iv:
+            if current_iv <= entry_iv * (1 - self.criteria.exit_iv_crush):
+                return "IV Crush Exit"
+
+        return None
+
+    def _fallback_delta(self, position: Dict, snapshot: Dict) -> Optional[float]:
+        """
+        Black-Scholes delta for when the feed returns no Greeks, which it does
+        for contracts deep in or far out of the money - exactly where the delta
+        exits matter. None when there is no volatility to price with.
+        """
+        iv = snapshot.get('impliedVolatility') or position.get('last_iv') or position.get('entry_iv')
+        if not iv:
+            return None
+        try:
+            spot = float(self.data_fetcher.get_quote(position['symbol'])['lastTradePrice'])
+        except Exception as e:
+            print(f"Error getting underlying price for {position['symbol']}: {e}")
+            return None
+        days_left = position['dte'] - (datetime.now() - position['entry_date']).days
+        if position['option_type'] == 'call':
+            return self._calculate_call_delta(spot, position['strike'], iv, days_left)
+        return self._calculate_put_delta(spot, position['strike'], iv, days_left)
     
     def _check_technical_exit_signals(self, position: Dict) -> Optional[str]:
         """Check for technical exit signals"""
@@ -636,33 +958,31 @@ class OptionsBuyStrategy:
             
             # Calculate current RSI
             rsi = self._calculate_rsi(prices)
-            
-            # RSI reversal signals
-            if position['option_type'] == 'call':
-                # For calls, exit if RSI becomes overbought (>70) and starts declining
-                if rsi > 70 and len(prices) >= 3:
-                    recent_rsi = self._calculate_rsi(prices[-3:])
-                    if recent_rsi < rsi:  # RSI declining from overbought
-                        return "RSI Reversal Signal"
-            
+
+            # A breakout trade is held on a different thesis. RSI being stretched
+            # is expected there, so the RSI exit below would close it the moment
+            # it opened; what ends it is price falling back through the level.
+            breakout_level = position.get('breakout_level')
+            on_breakout = position.get('entry_regime', 'range') != 'range' and breakout_level
+            if on_breakout:
+                buffer = self.criteria.breakout_failure_buffer
+                if position['option_type'] == 'call' and current_price < breakout_level * (1 - buffer):
+                    return "Failed Breakout - back below resistance"
+                if position['option_type'] == 'put' and current_price > breakout_level * (1 + buffer):
+                    return "Failed Breakout - back above support"
+
+            # RSI reversal signals: the reading from two sessions back was at an
+            # extreme and today's has turned back from it.
+            prior_rsi = self._calculate_rsi(prices[:-2])
+            if on_breakout:
+                pass
+            elif position['option_type'] == 'call':
+                if prior_rsi > 70 and rsi < prior_rsi:
+                    return "RSI Reversal Signal"
+
             elif position['option_type'] == 'put':
-                # For puts, exit if RSI becomes oversold (<30) and starts rising
-                if rsi < 30 and len(prices) >= 3:
-                    recent_rsi = self._calculate_rsi(prices[-3:])
-                    if recent_rsi > rsi:  # RSI rising from oversold
-                        return "RSI Reversal Signal"
-            
-            # Support/Resistance breaks
-            resistance_level = position.get('resistance_level')
-            support_level = position.get('support_level')
-            
-            if resistance_level and current_price > resistance_level * 1.02:  # 2% break
-                if position['option_type'] == 'put':
-                    return "Resistance Break - Put Exit"
-            
-            if support_level and current_price < support_level * 0.98:  # 2% break
-                if position['option_type'] == 'call':
-                    return "Support Break - Call Exit"
+                if prior_rsi < 30 and rsi > prior_rsi:
+                    return "RSI Reversal Signal"
             
             # Momentum divergence (simplified)
             momentum = self._calculate_momentum(prices)
@@ -695,7 +1015,7 @@ class OptionsBuyStrategy:
                 (current_price - position['entry_price'])
                 * position['position_size']
                 * OPTION_CONTRACT_MULTIPLIER
-            )
+            ) + position.get('realized_pnl', 0.0)
             
             # Move to closed positions
             self.open_positions.remove(position)

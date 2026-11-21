@@ -80,6 +80,18 @@ class AlpacaOptionsPlaySandboxExecutor:
 
         return max(min(by_risk, by_buying_power), 0)
 
+    def max_affordable_premium(self) -> float:
+        """
+        Highest per-share premium at which _calculate_quantity still buys one
+        contract. Lets the caller pass over contracts it could never size
+        instead of spending its order slot on one.
+        """
+        account = self.data_fetcher.get_account()
+        equity = float(account.get("equity", 0.0))
+        buying_power = float(account.get("buying_power", 0.0))
+        risk_budget = equity * (self.strategy.criteria.max_risk_per_trade / 100.0)
+        return min(risk_budget, buying_power) / OPTION_CONTRACT_MULTIPLIER
+
     def _collect_option_candidates(self, symbol: str) -> List[Dict[str, Any]]:
         chain = self.data_fetcher.get_option_chain(symbol)
         candidates: List[Dict[str, Any]] = []
@@ -108,6 +120,8 @@ class AlpacaOptionsPlaySandboxExecutor:
                                 "bid": float(bid),
                                 "ask": float(ask),
                                 "mid": (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0,
+                                "delta": leg.get("delta"),
+                                "theta": leg.get("theta"),
                             }
                         )
         return candidates
@@ -194,6 +208,14 @@ class AlpacaOptionsPlaySandboxExecutor:
                 target_dte=option["dte"],
             )
 
+            # Re-checked here because the contract is re-resolved from a fresh
+            # chain and may not be the one the scan qualified.
+            if resolved.get("delta") is None or resolved.get("theta") is None:
+                raise ValueError(
+                    f"{resolved['option_symbol']} has no Greeks in the feed; not buying a "
+                    "contract the Greek exits can't monitor."
+                )
+
             limit = resolved["ask"] if resolved["ask"] > 0 else metrics.get("mid_price", 0)
             if limit <= 0:
                 raise ValueError("Could not determine a valid limit price for the option order.")
@@ -233,8 +255,10 @@ class AlpacaOptionsPlaySandboxExecutor:
                     # not the (possibly stale) values captured during the earlier scan.
                     position["option_symbol"] = resolved["option_symbol"]
                     position["entry_price"] = limit
+                    # Needed by monitor_and_close to tell "order hasn't filled yet" apart
+                    # from "position filled and is now gone" when get_position() is empty.
+                    position["order_id"] = (result.response or {}).get("id")
                     position["max_risk"] = limit * quantity * 100
-                    position["profit_target"] = limit * self.strategy.criteria.profit_target_multiplier
                     position["stop_loss"] = limit * self.strategy.criteria.stop_loss_multiplier
                     result.impact = result.impact or {}
                     result.impact["tracked_position_id"] = position["id"]
@@ -308,10 +332,21 @@ class AlpacaOptionsPlaySandboxExecutor:
 
         return result
 
+    # Order still working its way to a fill; not a position yet, not gone either.
+    _OPEN_ORDER_STATUSES = {
+        "new", "accepted", "pending_new", "accepted_for_bidding",
+        "partially_filled", "pending_cancel", "pending_replace",
+        "calculated", "held", "pending_review",
+    }
+    # Order died before ever filling: there was never a real position to close.
+    _TERMINAL_UNFILLED_STATUSES = {
+        "canceled", "expired", "rejected", "done_for_day", "replaced", "suspended", "stopped",
+    }
+
     def monitor_and_close(self, submit_order: bool = True) -> List[AlpacaSandboxOrderResult]:
         """
         Check tracked open positions against live Alpaca data. Closes any that hit an
-        exit condition (profit target, stop loss, time decay, technical signal), and
+        exit condition (stop loss, time decay, technical or Greek signal), and
         reconciles positions no longer held at the broker (expired or exercised).
         """
         if self.strategy is None:
@@ -327,28 +362,108 @@ class AlpacaOptionsPlaySandboxExecutor:
             broker_position = self.data_fetcher.get_position(option_symbol)
 
             if broker_position is None:
-                # Contract is no longer held: expired worthless, was exercised/assigned,
-                # or was closed outside this tool. We have no reliable exit price.
-                position["status"] = "closed"
-                position["exit_date"] = datetime.now()
-                position["exit_reason"] = "No longer held at Alpaca (expired, exercised, or closed elsewhere)"
-                position["final_pnl"] = None
-                self.strategy.open_positions.remove(position)
-                self.strategy.closed_positions.append(position)
+                self._reconcile_missing_position(position)
                 continue
 
             current_price = float(broker_position.get("current_price", 0.0))
-            exit_reason = self.strategy.evaluate_exit(position, current_price)
-            if not exit_reason:
-                continue
-
-            results.append(
-                self.close_opportunity(
-                    position,
-                    current_price=current_price,
-                    exit_reason=exit_reason,
-                    submit_order=submit_order,
-                )
+            exit_reason = self.strategy.evaluate_exit(
+                position, current_price, snapshot=self._option_snapshot(option_symbol)
             )
+            if exit_reason:
+                results.append(
+                    self.close_opportunity(
+                        position,
+                        current_price=current_price,
+                        exit_reason=exit_reason,
+                        submit_order=submit_order,
+                    )
+                )
 
         return results
+
+    def _option_snapshot(self, option_symbol: str) -> Optional[Dict[str, Any]]:
+        """Live Greeks and IV for one contract, or None so the Greek exits are skipped."""
+        try:
+            return self.data_fetcher.get_option_snapshots([option_symbol]).get(option_symbol)
+        except Exception as exc:
+            print(f"Could not fetch snapshot for {option_symbol}: {exc}")
+            return None
+
+    def _reconcile_missing_position(self, position: Dict[str, Any]) -> None:
+        """
+        get_position() found nothing, which is ambiguous on its own: it means either
+        the entry order hasn't filled yet (still working, or died without filling -
+        completely normal right after entry, since these are day-limit orders) or a
+        real position existed and is now gone. Only the entry order's own status
+        tells those apart, so check it before concluding anything.
+        """
+        order_id = position.get("order_id")
+        order = self.data_fetcher.get_order(order_id) if order_id else None
+
+        if order is None:
+            # No order to check against (e.g. an older record from before this field
+            # existed). Fall back to the previous best-effort behavior rather than
+            # silently losing the position.
+            self._close_with_unknown_pnl(
+                position, "No longer held at Alpaca (expired, exercised, or closed elsewhere)"
+            )
+            return
+
+        status = order.get("status")
+        filled_qty = float(order.get("filled_qty") or 0)
+
+        if filled_qty == 0 and status in self._OPEN_ORDER_STATUSES:
+            # Never filled yet. Leave it tracked and check again next tick.
+            return
+
+        if filled_qty == 0 and status in self._TERMINAL_UNFILLED_STATUSES:
+            # Entry order died before ever filling - this was never a real position,
+            # so it doesn't belong in closed_positions distorting P&L stats either.
+            self.strategy.open_positions.remove(position)
+            return
+
+        # The fill can land between the position lookup and the order lookup -
+        # queued orders fill in the first seconds after the open - so the order
+        # reads as filled while the position read was empty. Look again before
+        # calling it closed.
+        if self.data_fetcher.get_position(position["option_symbol"]) is not None:
+            return
+
+        # The entry order did fill at some point and the position is gone now: a
+        # genuine close. Look for the actual closing fill before giving up on price.
+        exit_price = self._find_closing_fill_price(
+            position["option_symbol"], after=order.get("filled_at")
+        )
+        if exit_price is not None:
+            self.strategy.close_position(
+                {
+                    "position": position,
+                    "current_price": exit_price,
+                    "exit_reason": "Closed at broker (reconciled from fill history)",
+                }
+            )
+        else:
+            self._close_with_unknown_pnl(
+                position,
+                "Closed at broker with no recoverable exit price (likely expired ITM/OTM)",
+            )
+
+    def _close_with_unknown_pnl(self, position: Dict[str, Any], reason: str) -> None:
+        position["status"] = "closed"
+        position["exit_date"] = datetime.now()
+        position["exit_reason"] = reason
+        position["final_pnl"] = None
+        self.strategy.open_positions.remove(position)
+        self.strategy.closed_positions.append(position)
+
+    def _find_closing_fill_price(self, option_symbol: str, after: Optional[str]) -> Optional[float]:
+        try:
+            orders = self.data_fetcher.list_orders(
+                symbol=option_symbol, status="closed", side="sell", after=after, limit=10
+            )
+        except Exception:
+            return None
+        for order in orders:
+            if order.get("status") == "filled" and order.get("filled_avg_price"):
+                return float(order["filled_avg_price"])
+        return None

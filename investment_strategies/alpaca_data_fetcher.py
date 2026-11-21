@@ -1,18 +1,80 @@
 import json
 import os
+import random
 import re
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Deque, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import requests
 from requests.auth import _basic_auth_str
-from requests.exceptions import HTTPError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import HTTPError, Timeout
 
 ALPACA_CREDENTIALS_FILE = "alpaca_credentials.json"
 DEFAULT_PAPER_TRADING_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DATA_URL = "https://data.alpaca.markets"
 DEFAULT_BROKER_SANDBOX_URL = "https://broker-api.sandbox.alpaca.markets"
+
+# Alpaca allows 200 requests/min per API key, counted separately for the trading
+# API and the market data API (both 200/min on the free Basic plan). Default to a
+# little under that so clock skew between our window and Alpaca's does not push us
+# over the edge.
+DEFAULT_REQUESTS_PER_MINUTE = 190
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+# Retried transient statuses: 429 is the rate limiter; 5xx are the intermittent
+# gateway failures Alpaca returns under load (a 503 on v2/account has been seen
+# in the hourly cron log).
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+class _RateLimiter:
+    """
+    Sliding-window limiter: at most `limit` acquisitions per `window` seconds.
+
+    One instance per API host, since Alpaca meters the trading and market data
+    APIs independently. `block()` parks the whole bucket, so a 429 on one request
+    also holds back every later request to that host rather than letting them
+    queue straight into another 429.
+    """
+
+    def __init__(self, limit: int, window: float = RATE_LIMIT_WINDOW_SECONDS):
+        self.limit = max(1, limit)
+        self.window = window
+        self._hits: Deque[float] = deque()
+        self._blocked_until = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+
+                if now < self._blocked_until:
+                    sleep_for = self._blocked_until - now
+                else:
+                    while self._hits and now - self._hits[0] >= self.window:
+                        self._hits.popleft()
+                    if len(self._hits) < self.limit:
+                        self._hits.append(now)
+                        return
+                    # Wait for the oldest hit to age out of the window.
+                    sleep_for = self.window - (now - self._hits[0])
+
+            time.sleep(max(sleep_for, 0.01))
+
+    def block(self, seconds: float) -> None:
+        """Hold every request to this host for `seconds` (used after a 429)."""
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._blocked_until = max(self._blocked_until, time.monotonic() + seconds)
 
 
 @dataclass
@@ -61,10 +123,20 @@ class AlpacaDataFetcher:
         credentials_file: str = ALPACA_CREDENTIALS_FILE,
         data_feed: str = "iex",
         timeout_seconds: int = 20,
+        requests_per_minute: int = DEFAULT_REQUESTS_PER_MINUTE,
+        max_retries: int = 5,
+        backoff_base_seconds: float = 1.0,
+        backoff_cap_seconds: float = 60.0,
     ):
         self.credentials_file = credentials_file
         self.timeout_seconds = timeout_seconds
         self.data_feed = data_feed
+        self.requests_per_minute = requests_per_minute
+        self.max_retries = max_retries
+        self.backoff_base_seconds = backoff_base_seconds
+        self.backoff_cap_seconds = backoff_cap_seconds
+        self._rate_limiters: Dict[str, _RateLimiter] = {}
+        self._rate_limiter_lock = threading.Lock()
 
         loaded = self._load_credentials(credentials_file)
         self.credentials = credentials or loaded
@@ -104,6 +176,52 @@ class AlpacaDataFetcher:
         )
         return " ".join(hints)
 
+    def _limiter_for(self, url: str) -> _RateLimiter:
+        """One limiter per host: Alpaca meters trading/data/broker separately."""
+        host = urlsplit(url).netloc
+        with self._rate_limiter_lock:
+            limiter = self._rate_limiters.get(host)
+            if limiter is None:
+                limiter = _RateLimiter(self.requests_per_minute)
+                self._rate_limiters[host] = limiter
+            return limiter
+
+    def _retry_delay(self, attempt: int, response: Optional[requests.Response]) -> float:
+        """
+        How long to wait before retry number `attempt` (0-based).
+
+        Prefers whatever the server asked for -- `Retry-After` (seconds or an
+        HTTP date) or Alpaca's `X-RateLimit-Reset` (epoch seconds) -- and falls
+        back to exponential backoff. Jitter is always added so that a batch of
+        callers that got throttled together does not retry in lockstep.
+        """
+        server_delay = 0.0
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    server_delay = float(retry_after)
+                except ValueError:
+                    try:
+                        reset_at = parsedate_to_datetime(retry_after)
+                        if reset_at.tzinfo is None:
+                            reset_at = reset_at.replace(tzinfo=timezone.utc)
+                        server_delay = (reset_at - datetime.now(timezone.utc)).total_seconds()
+                    except (TypeError, ValueError):
+                        server_delay = 0.0
+            if server_delay <= 0:
+                reset_epoch = response.headers.get("X-RateLimit-Reset")
+                if reset_epoch:
+                    try:
+                        server_delay = float(reset_epoch) - time.time()
+                    except ValueError:
+                        server_delay = 0.0
+
+        backoff = self.backoff_base_seconds * (2**attempt)
+        delay = max(server_delay, backoff)
+        delay = min(delay, self.backoff_cap_seconds)
+        return max(delay, 0.0) + random.uniform(0, self.backoff_base_seconds)
+
     def _request(
         self,
         method: str,
@@ -115,24 +233,50 @@ class AlpacaDataFetcher:
     ) -> Dict[str, Any]:
         url = f"{(base_url or self.credentials.trading_base_url).rstrip('/')}/{path.lstrip('/')}"
         req_headers = headers or self._headers()
-        response = requests.request(
-            method=method.upper(),
-            url=url,
-            headers=req_headers,
-            params=params,
-            json=payload,
-            timeout=self.timeout_seconds,
-        )
-        try:
-            response.raise_for_status()
-        except HTTPError as exc:
-            if response.status_code == 401:
-                message = self._build_unauthorized_hint(url)
-                raise ValueError(message) from exc
-            raise
-        if not response.text:
-            return {}
-        return response.json()
+        limiter = self._limiter_for(url)
+
+        for attempt in range(self.max_retries + 1):
+            limiter.acquire()
+
+            try:
+                response = requests.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=req_headers,
+                    params=params,
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                )
+            except (RequestsConnectionError, Timeout):
+                # Nothing to learn from headers here; back off and try again.
+                if attempt >= self.max_retries:
+                    raise
+                time.sleep(self._retry_delay(attempt, None))
+                continue
+
+            try:
+                response.raise_for_status()
+            except HTTPError as exc:
+                if response.status_code == 401:
+                    message = self._build_unauthorized_hint(url)
+                    raise ValueError(message) from exc
+                if response.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, response)
+                    if response.status_code == 429:
+                        # Park the whole host, not just this call, so in-flight
+                        # work does not walk straight into another 429.
+                        limiter.block(delay)
+                    else:
+                        time.sleep(delay)
+                    continue
+                raise
+
+            if not response.text:
+                return {}
+            return response.json()
+
+        # Unreachable: the final attempt either returns or re-raises above.
+        raise RuntimeError(f"Exhausted retries for {method.upper()} {url}")
 
     def _data_request(
         self,
@@ -236,7 +380,10 @@ class AlpacaDataFetcher:
 
         params: Dict[str, Any] = {
             "timeframe": timeframe,
-            "adjustment": "raw",
+            # Split/dividend adjusted. Raw bars make a split look like a 200%+
+            # single-day move, which poisons any volatility or momentum figure
+            # derived from the series.
+            "adjustment": "all",
             "feed": self.data_feed,
             "limit": 1000,
         }
@@ -273,7 +420,12 @@ class AlpacaDataFetcher:
             "expiry_date": expiry.strftime("%Y-%m-%dT00:00:00Z"),
         }
 
-    def _normalize_option_snapshots(self, snapshots: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_option_snapshots(
+        self,
+        snapshots: Dict[str, Any],
+        open_interest_map: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        open_interest_map = open_interest_map or {}
         grouped: Dict[str, Dict[float, Dict[str, Any]]] = {}
 
         for option_symbol, snapshot in snapshots.items():
@@ -294,7 +446,11 @@ class AlpacaDataFetcher:
                 "bid": quote.get("bp", 0.0) or 0.0,
                 "ask": quote.get("ap", 0.0) or 0.0,
                 "volume": day_bar.get("v", snapshot.get("volume", 0)) or 0,
-                "openInterest": snapshot.get("open_interest", 0) or 0,
+                # Open interest is not carried on the snapshots endpoint at all; it is
+                # only exposed per-contract by v2/options/contracts, so it is merged in
+                # from there. Reading it off the snapshot always yielded 0, which meant
+                # every contract failed min_open_interest and no trade ever qualified.
+                "openInterest": open_interest_map.get(option_symbol, 0) or 0,
                 "impliedVolatility": snapshot.get("impliedVolatility", 0) or 0,
                 "delta": greeks.get("delta"),
                 "gamma": greeks.get("gamma"),
@@ -321,6 +477,55 @@ class AlpacaDataFetcher:
 
         return {"optionChain": option_chain, "options": option_chain}
 
+    def get_open_interest_map(
+        self,
+        underlying_symbol: str,
+        expiration_date_gte: Optional[str] = None,
+        expiration_date_lte: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """
+        Map option symbol -> open interest, sourced from v2/options/contracts.
+
+        Open interest is absent from the options snapshots endpoint on every feed,
+        so it has to be fetched separately and merged into the chain. Contracts
+        without a reported open interest are omitted rather than defaulted to 0.
+
+        The expiry bounds matter: an unbounded query returns a truncated single
+        page with no continuation token (~378 of AAPL's ~1600 contracts), while a
+        date-scoped query paginates correctly. Callers should pass the range they
+        actually care about.
+        """
+        open_interest: Dict[str, int] = {}
+        params: Dict[str, Any] = {
+            "underlying_symbols": underlying_symbol,
+            "status": "active",
+            "limit": 1000,
+        }
+        if expiration_date_gte:
+            params["expiration_date_gte"] = expiration_date_gte
+        if expiration_date_lte:
+            params["expiration_date_lte"] = expiration_date_lte
+        page_token: Optional[str] = None
+
+        while True:
+            if page_token:
+                params["page_token"] = page_token
+            data = self._request("GET", "v2/options/contracts", params=params)
+            for contract in data.get("option_contracts", []):
+                raw = contract.get("open_interest")
+                option_symbol = contract.get("symbol")
+                if raw is None or not option_symbol:
+                    continue
+                try:
+                    open_interest[option_symbol] = int(raw)
+                except (TypeError, ValueError):
+                    continue
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
+        return open_interest
+
     def get_option_chain(self, symbol: str) -> Dict[str, Any]:
         snapshots: Dict[str, Any] = {}
         params: Dict[str, Any] = {"feed": "indicative", "limit": 1000}
@@ -339,7 +544,26 @@ class AlpacaDataFetcher:
             if not page_token:
                 break
 
-        return self._normalize_option_snapshots(snapshots)
+        # Scope the open-interest lookup to the expiries actually present in the
+        # chain, since an unbounded contracts query silently truncates.
+        expiries = sorted(
+            parsed["expiry"]
+            for parsed in (
+                self._parse_option_symbol(option_symbol) for option_symbol in snapshots
+            )
+            if parsed
+        )
+        open_interest_map = (
+            self.get_open_interest_map(
+                symbol,
+                expiration_date_gte=expiries[0].strftime("%Y-%m-%d"),
+                expiration_date_lte=expiries[-1].strftime("%Y-%m-%d"),
+            )
+            if expiries
+            else {}
+        )
+
+        return self._normalize_option_snapshots(snapshots, open_interest_map)
 
     def get_option_contracts(
         self,
@@ -485,6 +709,36 @@ class AlpacaDataFetcher:
 
     def place_order(self, account_id: str, order_payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._request("POST", "v2/orders", payload=order_payload)
+
+    def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Look up a single order by id. Used to tell 'never filled' apart from 'filled, then closed'."""
+        try:
+            return self._request("GET", f"v2/orders/{order_id}")
+        except HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
+    def list_orders(
+        self,
+        symbol: Optional[str] = None,
+        status: str = "all",
+        side: Optional[str] = None,
+        after: Optional[str] = None,
+        direction: str = "asc",
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"status": status, "direction": direction, "limit": limit}
+        if symbol:
+            params["symbols"] = symbol
+        if side:
+            params["side"] = side
+        if after:
+            params["after"] = after
+        return self._request("GET", "v2/orders", params=params)
+
+    def is_market_open(self) -> bool:
+        return bool(self._request("GET", "v2/clock").get("is_open"))
 
     def get_positions(self) -> List[Dict[str, Any]]:
         return self._request("GET", "v2/positions")
