@@ -1,0 +1,612 @@
+# Masari improvement roadmap
+
+Turns the backtest findings and the scanner review of Nov 2026 into 29 tickets in 8 epics. Ticket ids match the Linear team Masari0 (key MAS; MAS-1 to MAS-4 are Linear's onboarding issues). Jira assigns its own keys on import (`ROADMAP_jira_import.csv` and `ROADMAP_linear_import.csv`, same content).
+
+## Where the numbers come from
+
+Backtests on the account's 110 real option trades (Aug 31 - Nov 18, 2026). Exits are replayed on hourly option bars, filled 2% below the bar close. Total P&L of each scenario:
+
+| Scenario | Trades | P&L |
+|---|---:|---:|
+| What actually happened | 110 | -$12,171 |
+| Same trades, current exit rules, clean fills | 110 | -$1,047 |
+| Trend entry filter + current exits | 32 | +$5,967 |
+| Trend filter + SPY put gate + current exits | 26 | +$7,483 |
+
+Limits of the evidence, which this roadmap is built around:
+
+- **Small samples.** The filter's out-of-sample result rests on 10 trades, and the SPY gate's extra gain on 6. Without its top 3 winners, filter + current exits falls from +$5,967 to about +$1,200.
+- **The backtests only see trades the bot took**, not what it would have bought instead. MAS-9 fixes that for the future.
+- **Technical and Greek exits are not simulated**; their cost comes from comparing real exits with holding.
+
+So everything ships behind a setting that is off by default, runs in shadow mode first, and is then frozen for 40 trades before anything is judged (AGENTS.md section 10).
+
+## Timeline
+
+| Phase | When | Tickets | Note |
+|---|---|---|---|
+| Phase 1: measure correctly | week 1 | MAS-5, MAS-6, MAS-7, MAS-8, MAS-21, MAS-25 | No trading change. |
+| Phase 2: build behind settings | weeks 2-3 | MAS-9, MAS-10, MAS-11, MAS-12, MAS-13, MAS-14, MAS-17, MAS-18, MAS-19, MAS-27, MAS-28 | Everything ships off by default, so nothing changes live yet. |
+| Phase 3: shadow mode | weeks 3-5 | MAS-22, MAS-15, MAS-16, MAS-20, MAS-29, MAS-30, MAS-31, MAS-32 | The filter, the gate and the exits only log their decisions. |
+| Phase 4: go-live and freeze | week 6 | MAS-23 | One configuration switch, then no parameter changes. |
+| Phase 5: evaluate | after 40 trades (roughly 1-4 months) | MAS-24, MAS-33 | Decide the open questions with real data. |
+| Anytime |  | MAS-26 | Low priority. |
+
+The evaluation window may take a while: the bot made about 2 trades per trading day, and the filter kept 29% of them. If the scanner simply replaces skipped trades with the next candidate that passes, 40 trades take about a month; if not, closer to 3-4 months.
+
+## Dependencies
+
+```
+MAS-5 backtest harness ----> MAS-13 trend filter --> MAS-14 SPY put gate --+
+MAS-8 scan coverage -> MAS-9 decision log --+--> MAS-22 shadow run ------+
+MAS-6 state-file lock --> MAS-17 exit flags -+                           |
+                     \--> MAS-18 cooldown -------------------------------+
+MAS-7 real fills --> MAS-10 limit exits --> MAS-11 opening guard ----------+
+MAS-19 exposure cap ------------------------------------------------------+
+MAS-27 scan fallback -----------------------------------------------------+
+MAS-21 evaluation plan ---------------------------------------------------+--> MAS-23 go-live --> MAS-24 evaluation
+
+MAS-13/10 --> MAS-28 checks before chain --> MAS-32 faster scan
+MAS-9 decision log --> MAS-29 split scoring, MAS-30 breakeven ratio, MAS-31 earnings (shadow; decided in MAS-24)
+MAS-9 + MAS-24 --> MAS-33 calibrate weights
+```
+
+## E1: Measurement and data integrity
+
+Make the data trustworthy before changing any trading rule. Nothing in this epic changes what the bot buys or sells.
+
+| Ticket | Type | Priority | Points | Depends on |
+|---|---|---|---:|---|
+| MAS-5 Commit the backtest harness and its tests | Task | Highest | 2 | - |
+| MAS-6 Fix the scan/monitor state-file overwrite (bug #1) | Bug | Highest | 3 | - |
+| MAS-7 Record actual fill prices for entries and exits | Bug | High | 3 | - |
+| MAS-8 Log per-symbol scan failures and scan coverage (bug #6) | Bug | High | 2 | - |
+| MAS-9 Per-scan decision log (JSONL) | Story | High | 3 | MAS-8 |
+
+### MAS-5: Commit the backtest harness and its tests
+
+**Task · Highest · 2 pts · depends on: nothing**
+
+**Why:** Every proposal in this roadmap rests on backtest_technical_entry.py, backtest_exits.py and backtest_combined.py, which are still untracked. AGENTS.md section 10 says there is no backtest harness; this is one.
+
+**Scope:**
+
+- Move the three backtest scripts and test_technical_entry_filter.py into backtests/ (keep them importable).
+- Add a backtests section to AGENTS.md: what each script does, the fill model, and the in-sample/out-of-sample split at 2026-10-19.
+- Keep everything read-only against Alpaca (GET requests only).
+
+**Done when:**
+
+- [ ] pytest backtests/ passes (9 tests).
+- [ ] python -m backtests.backtest_combined reproduces the reference numbers: actual -$12,171 on 110 trades; filter + SPY gate + live_now +$7,483 on 26 trades.
+- [ ] No credentials or keys in any committed file.
+
+### MAS-6: Fix the scan/monitor state-file overwrite (bug #1)
+
+**Bug · Highest · 3 pts · depends on: nothing**
+
+**Why:** The hourly scan loads alpaca_sandbox_positions.json at :00 and saves ~10 minutes later, overwriting the monitor's saves. 10 of 88 closed trades lost their exit reason this way, so exit rules cannot be judged.
+
+**Scope:**
+
+- Put an exclusive file lock around every load-modify-save of the state file (scan and monitor).
+- In the scan, reload and merge just before saving instead of writing back the copy loaded at start.
+- Write the file atomically (temp file + rename).
+
+**Done when:**
+
+- [ ] A test that interleaves a scan save and a monitor save loses neither change.
+- [ ] After one week live, zero new closed trades read 'Closed at broker (reconciled from fill history)' for exits the monitor itself placed.
+
+### MAS-7: Record actual fill prices for entries and exits
+
+**Bug · High · 3 pts · depends on: nothing**
+
+**Why:** Entries are recorded at the limit price and exits at the last price the monitor read, so the tracking file says -$9,069 where the broker implies about -$7,400 (AGENTS.md section 8). Slippage cannot be measured without real fills.
+
+**Scope:**
+
+- After an entry fills, overwrite entry_price with the order's filled_avg_price; keep the intended price as entry_limit_price.
+- After an exit order, poll it until filled (or the next monitor run) and store exit_fill_price; compute final_pnl from fills.
+- Store per-trade slippage (fill vs mid at decision time).
+
+**Done when:**
+
+- [ ] For every trade closed after the change, tracking-file P&L matches Alpaca's fills to within $1.
+- [ ] Slippage per trade is visible in the state file.
+
+### MAS-8: Log per-symbol scan failures and scan coverage (bug #6)
+
+**Bug · High · 2 pts · depends on: nothing**
+
+**Why:** _get_option_chain_analysis swallows exceptions and the symbol silently vanishes. A scan covering 300 of 503 symbols looks like a clean one.
+
+**Scope:**
+
+- Log each per-symbol exception with symbol and error type.
+- End every scan with a summary line: symbols scanned / errored / rejected by each filter / scored.
+- Map dotted tickers (BRK-B -> BRK.B) for the data API (bug #9).
+
+**Done when:**
+
+- [ ] Each scan's log ends with a coverage summary.
+- [ ] BRK.B and BF.B are scanned without a 400 error.
+
+### MAS-9: Per-scan decision log (JSONL)
+
+**Story · High · 3 pts · depends on: MAS-8**
+
+**Why:** The backtests can only judge trades the bot actually took; they cannot see what it would have bought instead. Logging every candidate fixes that and is what shadow mode (MAS-22) reads.
+
+**Scope:**
+
+- Each scan appends one JSON line per scored candidate to logs/decisions.jsonl: time, contract, side, price, score, regime, RSI, momentum, entry-filter decision and signals, SPY gate state, and why it was or was not ordered.
+- Include the option's bid/ask/mid and DTE so later backtests can price alternatives.
+
+**Done when:**
+
+- [ ] One full scan produces a decision line for every scored candidate.
+- [ ] A small script can rebuild 'what was ordered and why' for any scan from the file alone.
+
+## E2: Execution quality
+
+Stop giving away money on fills: market sells at the open and buys at the full ask.
+
+| Ticket | Type | Priority | Points | Depends on |
+|---|---|---|---:|---|
+| MAS-10 Exit with limit orders near the mid instead of market orders | Story | Highest | 5 | MAS-7 |
+| MAS-11 Opening-window guard for exits | Story | High | 2 | MAS-10 |
+| MAS-12 Enter at mid plus part of the spread instead of the full ask | Story | Medium | 3 | MAS-7 |
+
+### MAS-10: Exit with limit orders near the mid instead of market orders
+
+**Story · Highest · 5 pts · depends on: MAS-7**
+
+**Why:** Exits are market sell-to-close orders. The 36 stop-loss sells filled $3,629 worse than the hourly prices the backtest used. With clean fills, the current exit rules alone move the 110-trade history from -$12,171 to about -$1,000 (2% slippage model).
+
+**Scope:**
+
+- New setting exit_order_style = market | limit (default market until go-live).
+- limit: sell at the mid; if unfilled after ~60 seconds, step toward the bid, up to 3 steps within the run; after that, cross at the bid.
+- Always cross immediately when DTE <= 2 or the quote has no bid.
+- Cancel any leftover exit order before placing a new one (no duplicate sells).
+
+**Done when:**
+
+- [ ] Unit tests for the order payloads and the repricing steps.
+- [ ] Never two open sell orders for the same contract.
+- [ ] Average exit slippage vs mid is logged per trade (uses MAS-7).
+
+### MAS-11: Opening-window guard for exits
+
+**Story · High · 2 pts · depends on: MAS-10**
+
+**Why:** 52% of all exits land in the 09:30 or 09:45 run, totalling -$6,376 (AGENTS.md bug #4): spreads are widest right after an overnight gap.
+
+**Scope:**
+
+- New setting open_guard_minutes (default 0; go-live value 30).
+- During the window, defer every exit except the stop loss.
+- Stops during the window use the limit logic from MAS-10, never a market order.
+
+**Done when:**
+
+- [ ] Tests: a technical exit at 09:35 is deferred to the first run after 10:00; a stop at 09:35 is placed as a limit.
+
+### MAS-12: Enter at mid plus part of the spread instead of the full ask
+
+**Story · Medium · 3 pts · depends on: MAS-7**
+
+**Why:** Every entry pays the full ask. The impact is not backtested (the data has no quotes at entry), so this ships with fill-rate tracking.
+
+**Scope:**
+
+- New setting entry_price_style = ask | mid_plus (default ask); mid_plus = mid + 25% of the spread.
+- Reprice once toward the ask after a few minutes; the day order still dies at the close.
+
+**Done when:**
+
+- [ ] Fill rate and entry slippage vs mid are logged.
+- [ ] If the fill rate drops below 70% over 20 orders, flag it in the evaluation (MAS-24).
+
+## E3: Entry quality
+
+Only buy in the direction of the stock's trend, and only buy puts when the market is falling. This is the largest measured gain.
+
+| Ticket | Type | Priority | Points | Depends on |
+|---|---|---|---:|---|
+| MAS-13 Trend entry filter in the live strategy | Story | Highest | 5 | MAS-5, MAS-9 |
+| MAS-14 SPY market gate for puts | Story | High | 2 | MAS-13 |
+| MAS-15 Research: mirror call gate and gate length | Spike | Low | 2 | MAS-5 |
+| MAS-16 Research: what range mode contributes once the filter is on | Spike | Low | 2 | MAS-22 |
+
+### MAS-13: Trend entry filter in the live strategy
+
+**Story · Highest · 5 pts · depends on: MAS-5, MAS-9**
+
+**Why:** Range mode buys calls on oversold stocks and puts on overbought ones, i.e. against the trend. The filter (SMA20 vs SMA50, momentum, MACD histogram, RSI zone; 4 of 5 with the trend required) keeps 32 of 110 trades. Those made -$137 as traded and +$5,967 under clean exits, vs -$12,171 actual. Before 2026-10-19 (not used to design it): +$3,026 over 10 trades.
+
+**Scope:**
+
+- Port TechnicalEntryFilter into investment_strategies/ with its config in OptionsBuyCriteria.
+- New setting entry_trend_filter = off | shadow | on (default off). shadow logs the decision only (MAS-9); on rejects the candidate before scoring.
+- Use the daily bars the scan already fetches (needs 60 bars; 100 are fetched).
+
+**Done when:**
+
+- [ ] Ported unit tests pass.
+- [ ] Golden test: on the 110 historical entries the live filter makes the same take/skip decisions as the backtest.
+- [ ] With the setting off, scan output is identical to today's.
+
+### MAS-14: SPY market gate for puts
+
+**Story · High · 2 pts · depends on: MAS-13**
+
+**Why:** Puts bought while SPY was above its 50-day lost under every exit rule (24 trades, -$4,431 actual). Those bought while SPY was below made +$2,303 under clean exits (18 trades). On top of the trend filter the gate adds about $1,500, but that rests on only 6 blocked puts.
+
+**Scope:**
+
+- New setting put_market_gate_sma (0 = off, go-live 50).
+- Fetch SPY daily bars once per scan; allow puts only if SPY's last completed close is below its SMA (same as the backtest).
+- Log the gate state in the decision log.
+
+**Done when:**
+
+- [ ] Golden test: blocks the same 24 of 42 historical puts as the backtest.
+- [ ] One extra SPY request per scan, not per symbol.
+
+### MAS-15: Research: mirror call gate and gate length
+
+**Spike · Low · 2 pts · depends on: MAS-5**
+
+**Why:** The logic says calls should face the same gate (calls only while SPY is above its SMA), but SPY was above its 50-day at 71 of 110 entries, so the history cannot judge it.
+
+**Scope:**
+
+- Add a call gate and SMA lengths 20/50/100 to backtest_combined.py.
+- Re-run at the 40-trade evaluation (MAS-24) when there is more varied market data.
+
+**Done when:**
+
+- [ ] A short write-up with sample sizes; no live change from this ticket.
+
+### MAS-16: Research: what range mode contributes once the filter is on
+
+**Spike · Low · 2 pts · depends on: MAS-22**
+
+**Why:** With the filter on, range mode's contrarian RSI bonus still ranks candidates that the filter then vetoes. It may just waste the single order slot or crowd out better trend candidates.
+
+**Scope:**
+
+- From the shadow-mode decision log, measure how often the top-ranked candidate was a range-mode trade the filter rejected.
+- Recommend: keep, re-score, or drop the range branch.
+
+**Done when:**
+
+- [ ] A recommendation with counts; any code change gets its own ticket.
+
+## E4: Exit simplification
+
+Turn off the October technical and Greek exits that cut winners early.
+
+| Ticket | Type | Priority | Points | Depends on |
+|---|---|---|---:|---|
+| MAS-17 Settings to turn off technical and Greek exits, logged as shadow exits | Story | High | 3 | MAS-6 |
+
+### MAS-17: Settings to turn off technical and Greek exits, logged as shadow exits
+
+**Story · High · 3 pts · depends on: MAS-6**
+
+**Why:** Compared with holding to the 50% stop and the 5-day time exit, the technical exits cost $2,234 over 18 trades and the Greek exits $2,594 over 7 trades, mostly by selling positions that would have recovered or kept running.
+
+**Scope:**
+
+- New settings technical_exits_enabled and greek_exits_enabled (default true; go-live false).
+- When disabled, still evaluate them and log 'would have exited: <reason> at <price>' so the decision can be revisited with data.
+- The stop loss and the time-decay exit are unchanged.
+
+**Done when:**
+
+- [ ] Tests: with both disabled only the stop and time exits sell.
+- [ ] Shadow exit lines appear in the log.
+
+## E5: Risk controls
+
+Cooldown after an exit and a portfolio-level exposure cap.
+
+| Ticket | Type | Priority | Points | Depends on |
+|---|---|---|---:|---|
+| MAS-18 Cooldown after an exit (bug #2) | Story | High | 2 | MAS-6 |
+| MAS-19 Portfolio-level exposure cap (bug #3) | Story | High | 3 | - |
+| MAS-20 Research: minimum days to expiry 7 vs 21 | Spike | Medium | 3 | MAS-9 |
+
+### MAS-18: Cooldown after an exit (bug #2)
+
+**Story · High · 2 pts · depends on: MAS-6**
+
+**Why:** The bot re-buys what it just sold, sometimes the same morning (NFLX put, INTC twice in one day). INTC was traded 9 times and NFLX 8, each round trip paying the spread.
+
+**Scope:**
+
+- Store last_exit_at and exit reason per underlying in the state file.
+- Settings cooldown_days (go-live 3 trading days) and cooldown_days_after_stop (go-live 5).
+- Check it next to _has_open_exposure and log the skip.
+
+**Done when:**
+
+- [ ] Tests: re-entry blocked inside the window, allowed after it, longer after a stop.
+
+### MAS-19: Portfolio-level exposure cap (bug #3)
+
+**Story · High · 3 pts · depends on: nothing**
+
+**Why:** Only new orders per scan are limited. The bot has held 7 positions at once, about 14% of equity at risk, with no cap.
+
+**Scope:**
+
+- Settings max_open_positions (go-live 5), max_total_premium_pct (go-live 10% of equity), max_same_direction (go-live 4).
+- Count broker positions plus open entry orders; skip new entries that would breach a limit and log why.
+
+**Done when:**
+
+- [ ] Tests for each limit, including pending orders counting toward it.
+
+### MAS-20: Research: minimum days to expiry 7 vs 21
+
+**Spike · Medium · 3 pts · depends on: MAS-9**
+
+**Why:** min_days_to_expiry = 7 is flagged in-code as a testing value (21 intended). It cannot be judged from past trades, because the 21+ DTE alternatives were never priced.
+
+**Scope:**
+
+- After ~3 weeks of decision logs, replay the best 21-45 DTE candidate for each scan against its hourly bars.
+- Compare with the 7-45 DTE choice under the same exit rules.
+
+**Done when:**
+
+- [ ] A recommendation with sample sizes; the change itself waits for MAS-24 so the frozen window is not broken.
+
+## E6: Rollout and validation
+
+Shadow mode, go-live, a frozen 40-trade evaluation window, and the decision report at its end.
+
+| Ticket | Type | Priority | Points | Depends on |
+|---|---|---|---:|---|
+| MAS-21 Pre-registered evaluation plan for the next 40 trades | Task | High | 1 | - |
+| MAS-22 Shadow-mode run (2-3 weeks) | Task | High | 2 | MAS-9, MAS-13, MAS-14, MAS-17 |
+| MAS-23 Go-live: switch on the v6 configuration | Task | High | 1 | MAS-10, MAS-11, MAS-18, MAS-19, MAS-21, MAS-22, MAS-27 |
+| MAS-24 40-trade evaluation and next decisions | Task | High | 2 | MAS-23 |
+
+### MAS-21: Pre-registered evaluation plan for the next 40 trades
+
+**Task · High · 1 pts · depends on: nothing**
+
+**Why:** Most parameter changes since September were made on 8-24 trades (AGENTS.md section 10). Write down the success criteria before seeing results.
+
+**Scope:**
+
+- Add a 'v6' phase to HISTORY.md: settings, start date, and the rule 'no parameter change for 40 trades'.
+- Define the metrics: win rate vs break-even win rate, average win/loss, P&L at the broker, exit slippage, fill rate, max drawdown.
+- Define the pass bar in advance (for example: broker P&L >= 0 and win rate above break-even).
+
+**Done when:**
+
+- [ ] The plan is committed before go-live (MAS-23).
+
+### MAS-22: Shadow-mode run (2-3 weeks)
+
+**Task · High · 2 pts · depends on: MAS-9, MAS-13, MAS-14, MAS-17**
+
+**Why:** Confirms the filter and the gate behave live as in the backtest before they can block a trade.
+
+**Scope:**
+
+- Deploy with entry_trend_filter = shadow, the put gate in shadow, and shadow exits logging.
+- Weekly: compare the trades taken with what the filter and the gate would have done, and the actual exits with the shadow exits.
+
+**Done when:**
+
+- [ ] A short report: the share of trades the filter would have skipped and their P&L, with no unexplained decisions.
+
+### MAS-23: Go-live: switch on the v6 configuration
+
+**Task · High · 1 pts · depends on: MAS-10, MAS-11, MAS-18, MAS-19, MAS-21, MAS-22, MAS-27**
+
+**Why:** Turns on every change at once, so the frozen window measures one configuration.
+
+**Scope:**
+
+- Set: entry_trend_filter = on, put_market_gate_sma = 50, exit_order_style = limit, open_guard_minutes = 30, technical and Greek exits off, cooldown 3/5 days, caps 5 positions / 10% / 4 same direction.
+- Optional: entry_price_style = mid_plus (MAS-12) if the shadow fill test looks fine.
+- Log the config hash on every run.
+
+**Done when:**
+
+- [ ] The first live day shows the new settings in the logs; no orders outside them.
+
+### MAS-24: 40-trade evaluation and next decisions
+
+**Task · High · 2 pts · depends on: MAS-23**
+
+**Why:** Judge v6 against the pre-registered plan (MAS-21), then decide the open questions with real data.
+
+**Scope:**
+
+- Report every metric from MAS-21 with sample sizes, using broker fills.
+- Decide, each with its own evidence: bring back the 2x profit target (it beat no target by only ~$840 over 32 backtest trades), the call gate (MAS-15), DTE 21 (MAS-20), the range branch (MAS-16), split scoring (MAS-29, MAS-30), the earnings filter (MAS-31).
+
+**Done when:**
+
+- [ ] A written decision for each question, appended to HISTORY.md.
+
+## E7: Hygiene
+
+Low-priority cleanups from AGENTS.md section 9 and the install issues found this month.
+
+| Ticket | Type | Priority | Points | Depends on |
+|---|---|---|---:|---|
+| MAS-25 Fix the install: package conflicts and import-time orders | Bug | Medium | 1 | - |
+| MAS-26 Strategy hygiene: market-cap check and log noise | Task | Low | 2 | - |
+
+### MAS-25: Fix the install: package conflicts and import-time orders
+
+**Bug · Medium · 1 pts · depends on: nothing**
+
+**Why:** setup.py lists both binance (ccxt) and python-binance, which overwrite the same binance/ package, and misses lxml (needed by the S&P 500 scraper). stock_exchange.py places orders when imported.
+
+**Scope:**
+
+- Remove 'binance' from setup.py and add 'lxml'.
+- Move stock_exchange.py's order code under if __name__ == '__main__'.
+
+**Done when:**
+
+- [ ] A fresh venv installs cleanly and the scanner's universe loads.
+- [ ] Importing stock_exchange.py sends nothing.
+
+### MAS-26: Strategy hygiene: market-cap check and log noise
+
+**Task · Low · 2 pts · depends on: nothing**
+
+**Why:** min_market_cap is defined but never checked (bug #8), and division-by-zero RuntimeWarnings bury real errors (bug #10).
+
+**Scope:**
+
+- Apply min_market_cap in analyze_stock_for_options (or delete the setting).
+- Guard the Black-Scholes helpers against dte or iv equal to 0.
+
+**Done when:**
+
+- [ ] The scan log has no RuntimeWarning lines.
+
+## E8: Scanner
+
+Make the scan pick the best tradeable idea: fall back past blocked candidates, rank stocks by signal rather than by contract quirks, and scan faster. Found by reading the scoring code (Nov 22), not by backtest: only MAS-27 and MAS-28 are low-risk enough to ship before the shadow run.
+
+| Ticket | Type | Priority | Points | Depends on |
+|---|---|---|---:|---|
+| MAS-27 Fall back to the next candidate when the top pick is blocked | Bug | Highest | 2 | - |
+| MAS-28 Run the cheap stock checks before fetching the option chain | Story | High | 2 | MAS-13, MAS-14 |
+| MAS-29 Separate stock selection from contract selection in scoring | Story | Medium | 5 | MAS-9, MAS-22 |
+| MAS-30 Replace the constant risk/reward term with a breakeven-vs-expected-move ratio | Bug | Medium | 3 | MAS-9 |
+| MAS-31 Avoid holding through earnings | Story | Medium | 3 | MAS-9 |
+| MAS-32 Speed up the scan: batched requests and one history fetch per stock | Story | Medium | 3 | MAS-28 |
+| MAS-33 Calibrate score weights on the decision log | Spike | Low | 3 | MAS-9, MAS-24 |
+
+### MAS-27: Fall back to the next candidate when the top pick is blocked
+
+**Bug · Highest · 2 pts · depends on: nothing**
+
+**Why:** The CLI executes only opportunities[:max_orders] (1). When the top pick is rejected by the duplicate guard the loop ends and the hour buys nothing: about 47 times since Oct 16 (INTC 19, WMT 10, NFLX 10, NVDA 8; AGENTS.md section 5 step 9). The pooled list also holds the top 5 contracts per stock, so the next entries are usually the same stock.
+
+**Scope:**
+
+- Keep only the best-scoring contract per stock in the pooled list.
+- Walk down the ranked list until max_orders orders are placed, skipping candidates blocked by the duplicate guard, the cooldown (MAS-18) or the exposure caps (MAS-19); log each skip.
+- Stop after a bounded number of attempts (e.g. 10) so one scan cannot spray orders.
+
+**Done when:**
+
+- [ ] Test: with the top stock blocked, the second-best stock is ordered.
+- [ ] Test: two orders with --max-orders 2 are always on different stocks.
+- [ ] The log shows 'skipped <symbol>: <reason>' for each passed-over candidate.
+
+### MAS-28: Run the cheap stock checks before fetching the option chain
+
+**Story · High · 2 pts · depends on: MAS-13, MAS-14**
+
+**Why:** The option chain plus the open-interest lookup is the expensive part of each symbol's analysis, and it runs before any directional check. With the trend filter and SPY gate on, most stocks can be rejected from their daily bars alone.
+
+**Scope:**
+
+- Reorder analyze_stock_for_options: price/volume -> bars -> trend filter and SPY gate -> regime -> option chain.
+- If neither side passes, return without fetching the chain; if one side passes, keep only that side's contracts.
+
+**Done when:**
+
+- [ ] With the filter off, results are identical to today's.
+- [ ] With the filter on, the scan's request count and run time drop (record both before and after in the ticket).
+
+### MAS-29: Separate stock selection from contract selection in scoring
+
+**Story · Medium · 5 pts · depends on: MAS-9, MAS-22**
+
+**Why:** About 90 of the score's points come from contract and liquidity features, against at most ~65 from the directional signal. By delta the moneyness terms net out to 0 (0.30-0.40), +15 (0.40-0.50), -15 to 0 (0.50-0.60) and +20 (0.60-0.70), an accident of the arithmetic. The +20 liquidity bonus favours a few mega-liquid names, which matches the trade concentration.
+
+**Scope:**
+
+- Rank stocks by a signal score only (regime, trend strength, momentum, relative strength vs SPY).
+- For the chosen stock, pick the contract by a fixed rule: |delta| closest to a target (e.g. 0.50), DTE in a target band, tightest spread; liquidity stays a pass/fail filter, not points.
+- Ship behind scoring_mode = legacy | split, run split in shadow next to legacy and log both picks.
+
+**Done when:**
+
+- [ ] Shadow log shows both picks per scan for at least 3 weeks before any switch.
+- [ ] The switch is decided in MAS-24, not inside the frozen window.
+
+### MAS-30: Replace the constant risk/reward term with a breakeven-vs-expected-move ratio
+
+**Bug · Medium · 3 pts · depends on: MAS-9**
+
+**Why:** potential_profit is intrinsic value for in-the-money contracts and 2 x mid otherwise, so risk/reward is always exactly 2.0 out of the money (+15) and below 1 in the money (-15): a fixed 30-point swing on moneyness, not a measurement.
+
+**Scope:**
+
+- Compute the move needed to break even (premium / |delta| as a first approximation) and the expected move over the hold (price x IV x sqrt(days / 365)).
+- Score or filter on their ratio; ship inside scoring_mode = split (MAS-29).
+
+**Done when:**
+
+- [ ] Unit tests on hand-worked examples (ITM, ATM, OTM).
+- [ ] The ratio is written to the decision log for every candidate.
+
+### MAS-31: Avoid holding through earnings
+
+**Story · Medium · 3 pts · depends on: MAS-9**
+
+**Why:** No check exists for upcoming earnings. A 2-6 week option held through a report risks an overnight gap and an IV crush, which may explain part of the stop losses hit at the open. Untested: Alpaca has no earnings calendar.
+
+**Scope:**
+
+- Pick an earnings-date source (free API or scraped calendar) and cache dates daily.
+- First test the hypothesis: tag historical trades that spanned an earnings date and compare their P&L and stop rate.
+- If it holds, add skip_earnings_within_days (default off) to reject contracts whose expected hold spans a report.
+
+**Done when:**
+
+- [ ] The historical comparison is written up with sample sizes before the filter is switched on.
+
+### MAS-32: Speed up the scan: batched requests and one history fetch per stock
+
+**Story · Medium · 3 pts · depends on: MAS-28**
+
+**Why:** A full scan takes ~10 minutes, so orders go out on prices up to 10 minutes old. Each stock makes two bars requests (100 days for indicators, 1 year for realized volatility) and every request is per symbol.
+
+**Scope:**
+
+- Fetch one 1-year daily history per stock and derive both the indicators and the realized-volatility distribution from it.
+- Use Alpaca's multi-symbol bars and snapshot endpoints to load all stocks' bars and quotes in a few requests.
+- Keep the 190/min rate limiter.
+
+**Done when:**
+
+- [ ] Scan time and request count are logged; target under 3 minutes for 503 symbols.
+- [ ] Indicator values match the old code on a sample of 20 stocks.
+
+### MAS-33: Calibrate score weights on the decision log
+
+**Spike · Low · 3 pts · depends on: MAS-9, MAS-24**
+
+**Why:** Every weight in _calculate_opportunity_score was set by hand. Once the decision log holds outcomes, the weights can be measured.
+
+**Scope:**
+
+- Join decision-log candidates with their later option prices (hourly bars) to get each candidate's outcome under the frozen exit rules.
+- Regress outcome on each score component; report which components predict anything, with sample sizes.
+
+**Done when:**
+
+- [ ] A write-up proposing new weights or the removal of components; any change gets its own ticket and waits for the next window.
+
+---
+Total: 29 tickets, 75 story points.
